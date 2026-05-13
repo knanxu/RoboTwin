@@ -44,6 +44,27 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
 
+    def infer_with_hidden(self, obs: Dict) -> Dict:  # noqa: UP006
+        """Same as ``infer`` but asks the server to also return hidden features.
+
+        The response dict contains, in addition to the usual ``actions`` / ``state``:
+          - ``cond_emb``:  (prefix_width,) mean-pooled VLM prefix features
+          - ``suffix_out``: (action_horizon, expert_width) per-action-token features
+
+        Requires the server to wrap a PyTorch pi0.5 (drifting) policy exposing
+        ``infer_with_hidden``; otherwise the server returns an error.
+        """
+        if "_return_hidden" in obs:
+            raise ValueError("`_return_hidden` is a reserved key for the client")
+        payload = dict(obs)
+        payload["_return_hidden"] = True
+        data = self._packer.pack(payload)
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)
+
     @override
     def reset(self) -> None:
         pass
