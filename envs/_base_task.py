@@ -8,6 +8,7 @@ import gymnasium as gym
 import pdb
 import toppra as ta
 import json
+import time
 import transforms3d as t3d
 from collections import OrderedDict
 import torch, random
@@ -1476,7 +1477,17 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos',
+                    vel_scale: float = 1.0, acc_scale: float = 1.0):
+        """
+        Args:
+            action: 单帧动作 (action_dim,)
+            action_type: 'qpos' 或 'ee'
+            vel_scale / acc_scale: 仅对 action_type='qpos' 生效.
+                1.0 = 保持 mplib 默认约束 (与未加参数前行为等价).
+                >1.0 = 临时放大 TOPP 的 joint_vel_limits / joint_acc_limits,
+                调用结束后自动恢复.
+        """
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
@@ -1539,33 +1550,35 @@ class Base_Task(gym.Env):
             # TODO
             topp_left_flag, topp_right_flag = True, True
 
-            try:
-                times, left_pos, left_vel, acc, duration = (self.robot.left_mplib_planner.TOPP(left_path,
-                                                                                            1 / 250,
-                                                                                            verbose=True))
-                left_result = dict()
-                left_result["position"], left_result["velocity"] = left_pos, left_vel
-                left_n_step = left_result["position"].shape[0]
-            except Exception as e:
-                # print("left arm TOPP error: ", e)
-                topp_left_flag = False
-                left_n_step = 50  # fixed
+            with self.robot.left_mplib_planner.scaled_limits(vel_scale, acc_scale):
+                try:
+                    times, left_pos, left_vel, acc, duration = (self.robot.left_mplib_planner.TOPP(left_path,
+                                                                                                1 / 250,
+                                                                                                verbose=True))
+                    left_result = dict()
+                    left_result["position"], left_result["velocity"] = left_pos, left_vel
+                    left_n_step = left_result["position"].shape[0]
+                except Exception as e:
+                    # print("left arm TOPP error: ", e)
+                    topp_left_flag = False
+                    left_n_step = 50  # fixed
 
             if left_n_step == 0:
                 topp_left_flag = False
                 left_n_step = 50  # fixed
 
-            try:
-                times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
-                                                                                                1 / 250,
-                                                                                                verbose=True))
-                right_result = dict()
-                right_result["position"], right_result["velocity"] = right_pos, right_vel
-                right_n_step = right_result["position"].shape[0]
-            except Exception as e:
-                # print("right arm TOPP error: ", e)
-                topp_right_flag = False
-                right_n_step = 50  # fixed
+            with self.robot.right_mplib_planner.scaled_limits(vel_scale, acc_scale):
+                try:
+                    times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
+                                                                                                    1 / 250,
+                                                                                                    verbose=True))
+                    right_result = dict()
+                    right_result["position"], right_result["velocity"] = right_pos, right_vel
+                    right_n_step = right_result["position"].shape[0]
+                except Exception as e:
+                    # print("right arm TOPP error: ", e)
+                    topp_right_flag = False
+                    right_n_step = 50  # fixed
 
             if right_n_step == 0:
                 topp_right_flag = False
@@ -1656,14 +1669,218 @@ class Base_Task(gym.Env):
                 
             if self.check_success():
                 self.eval_success = True
+                _t_obs = time.perf_counter()
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                self._last_success_obs_time = time.perf_counter() - _t_obs
                 return
 
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()
+
+
+    def take_chunk_action(self, action_chunk, vel_scale: float = 1.0, acc_scale: float = 1.0, v: float = 1.0):
+        """
+        整段 TOPPRA 执行器: 对一整段 action chunk 做一次 TOPPRA 时间重参数化,
+        按 250Hz (对齐 scene.timestep) 密集采样后逐点下发.
+
+        与 take_action (逐帧 TOPP) 的差异:
+          - TOPP 求解次数从 chunk_size 降到 1
+          - 速度曲线全程连续, 段间不归零, vel_scale/acc_scale 加速效果充分发挥
+          - 双臂 12 dof 一起 TOPP, 时间天然对齐
+          - gripper 按路径参数位置插值 (不参与 TOPP)
+
+        Args:
+            action_chunk: (N, action_dim) 整段动作, 每行 =
+                [left_arm (left_arm_dim), left_gripper (1),
+                 right_arm (right_arm_dim), right_gripper (1)]
+                注意: 只支持 action_type='qpos', ee 模式用原 take_action.
+            vel_scale, acc_scale: TOPPRA 速度 / 加速度约束倍率.
+            v: chunk 压缩重构比率. v=1.0 不压缩; v>1.0 帧数减少 (走得更稀疏);
+               v<1.0 帧数增加 (插帧平滑). 压缩后的帧数 M 即为本次消耗的 cnt 预算.
+
+        Returns:
+            info: dict, 执行统计
+                status:           'success' | 'topp_fallback' | 'truncated'
+                fallback_reason:  None | str
+                duration:         float, TOPP 时长 (s)
+                dense_steps:      int, 实际下发的物理步数
+                take_action_cnt_delta: int, 本次消耗的 take_action_cnt
+                topp_return_code: str | None
+        """
+        info = {
+            "status": "success",
+            "fallback_reason": None,
+            "duration": 0.0,
+            "dense_steps": 0,
+            "take_action_cnt_delta": 0,
+            "topp_return_code": None,
+            "success_obs_time": 0.0,   # success 分支里 get_obs()+视频写入 的耗时, 用于调试/剔除
+        }
+
+        if self.take_action_cnt >= self.step_lim or self.eval_success:
+            info["status"] = "truncated"
+            return info
+
+        action_chunk = np.asarray(action_chunk)
+        if action_chunk.ndim != 2 or action_chunk.shape[0] == 0:
+            info["status"] = "topp_fallback"
+            info["fallback_reason"] = f"invalid chunk shape: {action_chunk.shape}"
+            return info
+
+        # ---- 先按 v 压缩 / 插帧重构 chunk ----
+        if v != 1.0:
+            from .utils.chunk_accel import reconstruct_chunk
+            action_chunk = reconstruct_chunk(action_chunk, float(v))
+            if action_chunk.shape[0] == 0:
+                info["status"] = "topp_fallback"
+                info["fallback_reason"] = f"reconstruct_chunk produced empty chunk at v={v}"
+                return info
+
+        # ---- 方案 β: 预算不够时截断 chunk, 保证 cnt 语义和原 take_action 一致 ----
+        remaining_budget = int(self.step_lim - self.take_action_cnt)
+        if action_chunk.shape[0] > remaining_budget:
+            action_chunk = action_chunk[:remaining_budget]
+            info["chunk_truncated"] = True
+            if action_chunk.shape[0] == 0:
+                info["status"] = "truncated"
+                return info
+
+        # 压缩后 chunk 帧数 M: 代表策略实际下发的 action 数量, 也是本次调用消耗的 cnt 预算
+        M = int(action_chunk.shape[0])
+
+        # ---- 拆分臂 / 夹爪 (复用 take_action 的拆法) ----
+        left_jointstate = self.robot.get_left_arm_jointState()
+        right_jointstate = self.robot.get_right_arm_jointState()
+        left_arm_dim = len(left_jointstate) - 1
+        right_arm_dim = len(right_jointstate) - 1
+        current_jointstate = np.array(left_jointstate + right_jointstate)
+
+        left_arm_actions = action_chunk[:, :left_arm_dim]
+        left_gripper_actions = action_chunk[:, left_arm_dim]
+        right_arm_actions = action_chunk[:, left_arm_dim + 1 : left_arm_dim + 1 + right_arm_dim]
+        right_gripper_actions = action_chunk[:, left_arm_dim + 1 + right_arm_dim]
+
+        current_state_arm = np.concatenate([
+            current_jointstate[:left_arm_dim],
+            current_jointstate[left_arm_dim + 1 : left_arm_dim + 1 + right_arm_dim],
+        ])
+        chunk_arm = np.concatenate([left_arm_actions, right_arm_actions], axis=1)  # (N, 12)
+
+        current_gripper = np.array([
+            self.robot.get_left_gripper_val(),
+            self.robot.get_right_gripper_val(),
+        ]).reshape(-1)
+        chunk_gripper = np.stack([left_gripper_actions, right_gripper_actions], axis=1)  # (N, 2)
+
+        # ---- 拼接双臂的 vel/acc limits (12 dof) ----
+        from .robot.toppra_chunk_executor import retime_chunk
+        left_p = self.robot.left_mplib_planner.planner
+        right_p = self.robot.right_mplib_planner.planner
+        joint_vel_limits = np.concatenate([
+            np.asarray(left_p.joint_vel_limits, dtype=np.float64),
+            np.asarray(right_p.joint_vel_limits, dtype=np.float64),
+        ])
+        joint_acc_limits = np.concatenate([
+            np.asarray(left_p.joint_acc_limits, dtype=np.float64),
+            np.asarray(right_p.joint_acc_limits, dtype=np.float64),
+        ])
+
+        # ---- 整段 TOPPRA ----
+        retimed = retime_chunk(
+            current_state_arm=current_state_arm,
+            chunk_arm=chunk_arm,
+            current_gripper=current_gripper,
+            chunk_gripper=chunk_gripper,
+            joint_vel_limits=joint_vel_limits,
+            joint_acc_limits=joint_acc_limits,
+            vel_scale=vel_scale,
+            acc_scale=acc_scale,
+            exec_hz=250,
+        )
+
+        if retimed["status"] != "success":
+            # TOPP 失败仍按消耗 M 计预算: 认为这 M 帧 action 被"下发"了但没跑成
+            # (作为后续 RL 的负信号: 坏 scale 选择既没推进任务也浪费预算)
+            self.take_action_cnt += M
+            info["status"] = "topp_fallback"
+            info["fallback_reason"] = retimed["fallback_reason"]
+            info["take_action_cnt_delta"] = M
+            return info
+
+        dense_arm = retimed["dense_arm_pos"]        # (T, 12)
+        dense_arm_vel = retimed["dense_arm_vel"]    # (T, 12)
+        dense_gripper = retimed["dense_gripper"]    # (T, 2)
+        T = dense_arm.shape[0]
+
+        info["duration"] = retimed["duration"]
+        info["topp_return_code"] = retimed["return_code"]
+
+        # ---- 外层 1 次调用 = M 个 action 下发, cnt 一次性加 M ----
+        # 物理步循环里只跑 scene.step + check_success, 不再动 cnt.
+        self.take_action_cnt += M
+        info["take_action_cnt_delta"] = M
+        print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m  (chunk M={M}, T={T})", end="\r")
+
+        # 视频帧: 整段开头写 1 帧, 保持与原 take_action 每次调用写 1 帧的语义
+        if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
+            try:
+                self.eval_video_ffmpeg.stdin.write(
+                    self.now_obs["observation"]["head_camera"]["rgb"].tobytes()
+                )
+            except Exception:
+                pass
+
+        # ---- 内部物理步循环 ----
+        # 硬上限防御: 正常 chunk T < 几千, 设 100000 防御病态 TOPP 输出.
+        T_cap = min(T, 100000)
+        step_taken = 0
+        for t in range(T_cap):
+            self._update_render()
+            if self.render_freq:
+                self.viewer.render()
+
+            # 左臂
+            self.robot.set_arm_joints(
+                dense_arm[t, :left_arm_dim],
+                dense_arm_vel[t, :left_arm_dim],
+                "left",
+            )
+            self.robot.set_gripper(float(dense_gripper[t, 0]), "left")
+            # 右臂
+            self.robot.set_arm_joints(
+                dense_arm[t, left_arm_dim:left_arm_dim + right_arm_dim],
+                dense_arm_vel[t, left_arm_dim:left_arm_dim + right_arm_dim],
+                "right",
+            )
+            self.robot.set_gripper(float(dense_gripper[t, 1]), "right")
+
+            self.scene.step()
+            self._update_render()
+            step_taken += 1
+
+            if self.check_success():
+                self.eval_success = True
+                _t_obs = time.perf_counter()
+                self.get_obs()
+                if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
+                    try:
+                        self.eval_video_ffmpeg.stdin.write(
+                            self.now_obs["observation"]["head_camera"]["rgb"].tobytes()
+                        )
+                    except Exception:
+                        pass
+                info["success_obs_time"] = time.perf_counter() - _t_obs
+                break
+
+        info["dense_steps"] = step_taken
+
+        self._update_render()
+        if self.render_freq:
+            self.viewer.render()
+        return info
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):

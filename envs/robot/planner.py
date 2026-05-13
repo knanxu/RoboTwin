@@ -7,6 +7,7 @@ import numpy as np
 import toppra as ta
 from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
 import transforms3d as t3d
+from contextlib import contextmanager
 import envs._GLOBAL_CONFIGS as CONFIGS
 
 
@@ -312,6 +313,33 @@ class MplibPlanner:
         self.planner_type = planner_type
         self.plan_step_lim = 2500
         self.TOPP = self.planner.TOPP
+
+    @contextmanager
+    def scaled_limits(self, vel_scale: float = 1.0, acc_scale: float = 1.0):
+        """
+        临时放大 TOPP 使用的 joint_vel_limits / joint_acc_limits, 退出时恢复.
+        scale=1.0 时为 no-op. 仅对 mplib 原生 Planner 生效 (SapienPlanner 路径
+        直接透传, 不保证支持).
+        """
+        if vel_scale == 1.0 and acc_scale == 1.0:
+            yield
+            return
+
+        p = self.planner
+        # SapienPlanner 没有这两个属性, 直接跳过
+        if not (hasattr(p, "joint_vel_limits") and hasattr(p, "joint_acc_limits")):
+            yield
+            return
+
+        orig_vel = np.array(p.joint_vel_limits, copy=True)
+        orig_acc = np.array(p.joint_acc_limits, copy=True)
+        try:
+            p.joint_vel_limits = orig_vel * vel_scale
+            p.joint_acc_limits = orig_acc * acc_scale
+            yield
+        finally:
+            p.joint_vel_limits = orig_vel
+            p.joint_acc_limits = orig_acc
 
     def show_info(self):
         print("joint_limits", self.planner.joint_limits)
