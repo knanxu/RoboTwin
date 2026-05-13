@@ -1,0 +1,109 @@
+# 一个 image, 两个 service: openpi server + RoboTwin 训练
+#
+# 前置:
+#   parent/
+#     ├── openpi/       <- drift branch, 有 infer_with_hidden
+#     └── RoboTwin/     <- 本仓库, 你在这里起 compose
+#
+#   pi0.5 checkpoint 放到宿主:
+#     ${OPENPI_DATA_HOME:-~/.cache/openpi}/checkpoints/<policy_config>/default/<step>
+#
+# 起:
+#   cd RoboTwin
+#   export POLICY_CONFIG=pi05_aloha_robotwin_drifting_shake_bottle
+#   export POLICY_DIR=/openpi_assets/checkpoints/$POLICY_CONFIG/default/29999
+#   docker compose -f docker/compose.yml up --build
+#
+# 只起 server 手动进 train 容器调试:
+#   docker compose -f docker/compose.yml up --build openpi_server
+#   docker compose -f docker/compose.yml run --rm robotwin_train bash
+#
+# 分卡 (2 张):
+#   OPENPI_GPU=0 ROBOTWIN_GPU=1 docker compose -f docker/compose.yml up --build
+
+services:
+  openpi_server:
+    image: speedtune:latest
+    build:
+      # 注意: context 是 RoboTwin 的父目录, 这样 Dockerfile 能同时 COPY
+      # openpi/ 和 RoboTwin/ 两个子目录
+      context: ..
+      dockerfile: RoboTwin/docker/speedtune.Dockerfile
+    init: true
+    tty: true
+    network_mode: host
+    environment:
+      SERVER_ARGS: "--port 8000 policy:checkpoint --policy.config=${POLICY_CONFIG:-pi05_aloha_robotwin_drifting_shake_bottle} --policy.dir=${POLICY_DIR:-/openpi_assets/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999}"
+      OPENPI_DATA_HOME: /openpi_assets
+      IS_DOCKER: "true"
+      NVIDIA_VISIBLE_DEVICES: "${OPENPI_GPU:-0}"
+    volumes:
+      - ../../openpi:/app/openpi
+      - ../:/app/RoboTwin
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+    working_dir: /app/openpi
+    command: >
+      bash -lc '
+        cd /app/openpi
+        /opt/venvs/openpi/bin/python scripts/serve_policy.py $${SERVER_ARGS}
+      '
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+  robotwin_train:
+    image: speedtune:latest
+    # 复用 openpi_server 的 build; docker 会识别已构建的 image 不重建
+    build:
+      context: ..
+      dockerfile: RoboTwin/docker/speedtune.Dockerfile
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+    depends_on:
+      - openpi_server
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${ROBOTWIN_GPU:-0}"
+      SERVER_HOST: "127.0.0.1"
+      SERVER_PORT: "8000"
+      TASK_NAME: "${TASK_NAME:-shake_bottle}"
+      TASK_CONFIG: "${TASK_CONFIG:-smoke_test}"
+      TOTAL_ENV_STEPS: "${TOTAL_ENV_STEPS:-50000}"
+      WARMUP_STEPS: "${WARMUP_STEPS:-1000}"
+      EXTRA_TRAIN_ARGS: "${EXTRA_TRAIN_ARGS:-}"
+    volumes:
+      - ../../openpi:/app/openpi
+      - ../:/app/RoboTwin
+    working_dir: /app/RoboTwin
+    command: >
+      bash -lc '
+        set -e
+        echo "[train] waiting for pi0.5 server at $${SERVER_HOST}:$${SERVER_PORT} ..."
+        for i in $$(seq 1 120); do
+          if (echo > /dev/tcp/$${SERVER_HOST}/$${SERVER_PORT}) >/dev/null 2>&1; then
+            echo "[train] server is up"; break
+          fi
+          sleep 2
+        done
+        source /opt/conda/etc/profile.d/conda.sh
+        conda activate RoboTwin
+        cd /app/RoboTwin
+        python -m speedtune.rl.train \
+          --task_name "$${TASK_NAME}" \
+          --task_config "$${TASK_CONFIG}" \
+          --server_host "$${SERVER_HOST}" \
+          --server_port "$${SERVER_PORT}" \
+          --total_env_steps "$${TOTAL_ENV_STEPS}" \
+          --warmup_steps "$${WARMUP_STEPS}" \
+          $${EXTRA_TRAIN_ARGS}
+      '
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]

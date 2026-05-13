@@ -1,0 +1,36 @@
+# 减少 docker 上传到 daemon 的上下文体积.
+# 注意: build context = RoboTwin 的父目录, 这里规则对 "parent" 下所有子路径生效.
+# 所以既屏蔽 RoboTwin 里的重目录, 也屏蔽 openpi 里的.
+
+# --- common ---
+**/.git
+**/.github
+**/.vscode
+**/.idea
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.swp
+**/*.log
+
+# --- RoboTwin 侧 ---
+RoboTwin/data
+RoboTwin/eval_result
+RoboTwin/camera_images
+RoboTwin/speedtune/rl/runs
+RoboTwin/models
+RoboTwin/third_party_cache
+RoboTwin/policy/*/checkpoints
+RoboTwin/policy/*/data
+RoboTwin/policy/*/models
+RoboTwin/policy/*/.venv
+
+# --- openpi 侧 (docker 只需要 pyproject.toml / uv.lock / packages / transformers_replace,
+# 源码走挂载. ckpt 绝对要排除) ---
+openpi/.venv
+openpi/checkpoints
+openpi/policy_records
+openpi/wandb
+openpi/.cache
+openpi/docs
+openpi/examples

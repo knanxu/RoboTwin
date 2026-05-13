@@ -22,19 +22,25 @@
 
 ```
 云端 GPU 主机
-├─ Docker 容器: openpi server (监听 0.0.0.0:8000)
-└─ 宿主 conda env "RoboTwin":
-     speedtune/rl/train.py
-       └─ WebsocketClient(127.0.0.1:8000)   ← 走宿主回环, 无额外延迟
-       └─ RoboTwin Sapien sim (headless)
-       └─ SAC (actor/critic on cuda)
+└─ docker compose (docker/compose.yml), 一个 image 起两个容器:
+     ├─ openpi_server   [venv: /opt/venvs/openpi, py3.11]
+     │    serve_policy.py, 监听 0.0.0.0:8000
+     └─ robotwin_train  [venv: conda RoboTwin, py3.10]
+          speedtune/rl/train.py
+            └─ WebsocketClient(127.0.0.1:8000)  ← 宿主回环, 无额外延迟
+            └─ RoboTwin Sapien sim (headless, EGL)
+            └─ SAC on cuda
 
 本机 (开发/监控)
-└─ ssh 进去看日志 / 端口转发 tensorboard
+└─ ssh 进去看 tmux 日志 / 端口转发 tensorboard
 ```
 
-本机完全不跑推理, pi0.5 权重也不用下到本机. 云端 GPU ≥ 24GB
-(PaliGemma 2B bf16 大约占 15GB, 留 5-8GB 给 RoboTwin + SAC).
+两个容器共享同一个 image (`speedtune:latest`) —— image 里同时装了:
+- `/opt/venvs/openpi` (uv 管理, py3.11, flax/jax/torch)
+- `conda env RoboTwin` (py3.10, sapien/mplib/curobo/pytorch3d + websockets)
+
+各自激活各自的 venv 跑不同入口, 互不干扰.
+本机不跑推理, pi0.5 权重也不用下到本机. 云端 GPU ≥ 24GB.
 
 
 ## Step 1: fork 仓库
@@ -42,96 +48,92 @@
 - fork **RoboTwin** (本仓库)
 - fork **openpi** 的带 drift model 和 `infer_with_hidden` 的分支
 
-把两个 fork 都 push 上去, 云端直接从 GitHub 拉.
+两个 fork push 上去.
 
 
-## Step 2: 云端环境准备
-
-登录云端主机一次性装好两套环境:
+## Step 2: 云端拉代码 + 放 checkpoint
 
 ```bash
-# 2a. openpi server (docker 方式, 自带 uv 依赖)
-git clone <your-openpi-fork>.git && cd openpi
-git checkout <your-drifting-branch>
-# 把 checkpoint 放到默认挂载位置 (compose.yml 映射 ~/.cache/openpi → /openpi_assets)
+# 要求两个仓库 side-by-side
+mkdir -p ~/work && cd ~/work
+git clone <your-openpi-fork>.git openpi
+git -C openpi checkout <your-drifting-branch>
+git clone <your-RoboTwin-fork>.git RoboTwin
+
+# 放 checkpoint (默认挂到容器里的 /openpi_assets)
 mkdir -p ~/.cache/openpi/checkpoints
-# 从你的云盘/rsync 把 ckpt 同步到
+# 把 ckpt 同步过来, 例如:
 #   ~/.cache/openpi/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999
-cd ..
-
-# 2b. RoboTwin conda env (宿主直接装, 不走 docker)
-git clone <your-RoboTwin-fork>.git && cd RoboTwin
-conda create -n RoboTwin python=3.10 -y
-conda activate RoboTwin
-bash script/_install.sh     # 装 sapien/mplib 并 patch 源码
-pip install websockets msgpack msgpack-numpy   # SAC 侧调 server 用
-# pytorch 按需装 cuda 对应版本
-cd ..
 ```
 
 
-## Step 3: 云端起 pi0.5 server
-
-**一个单独的 terminal** (tmux 会话里更稳):
+## Step 3: 一把起 server + 训练
 
 ```bash
-cd openpi
-export SERVER_ARGS="--port 8000 policy:checkpoint \
-  --policy.config=pi05_aloha_robotwin_drifting_shake_bottle \
-  --policy.dir=/openpi_assets/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999"
-docker compose -f scripts/docker/compose.yml up --build
+cd ~/work/RoboTwin
+
+# 选任务对应的 ckpt config
+export POLICY_CONFIG=pi05_aloha_robotwin_drifting_shake_bottle
+export POLICY_DIR=/openpi_assets/checkpoints/$POLICY_CONFIG/default/29999
+
+# 默认 server 和训练都拿 GPU 0; 两张卡就分开:
+# export OPENPI_GPU=0 ROBOTWIN_GPU=1
+
+docker compose -f docker/compose.yml up --build
 ```
 
-等日志打出 `server listening on 0.0.0.0:8000` 就绪. `network_mode: host`
-让容器直接复用主机的 8000 端口, 宿主里 `curl http://127.0.0.1:8000/healthz`
-应该返回 `OK`.
+第一次 build 会装 flax/jax/torch/sapien/pytorch3d/curobo 等, 估计 20-40 分钟.
+后续启动 <1 分钟. server 会先起, `robotwin_train` 会轮询 `127.0.0.1:8000`
+通了才启动训练.
 
 
-## Step 4: 云端起训练
+## Step 4: 调试 / 只起 server
 
-另开一个 terminal (也放 tmux 里):
+只起 server, 手动进训练容器跑:
 
 ```bash
-cd RoboTwin
+docker compose -f docker/compose.yml up --build openpi_server
+# 另开一个 shell
+docker compose -f docker/compose.yml run --rm robotwin_train bash
+# 容器里:
 conda activate RoboTwin
-python -m speedtune.rl.train \
-  --task_name shake_bottle \
-  --task_config smoke_test \
-  --server_host 127.0.0.1 \
-  --server_port 8000 \
-  --total_env_steps 50000 \
-  --warmup_steps 1000
+python -m speedtune.rl.train --task_name shake_bottle --task_config smoke_test
 ```
 
-日志和 tensorboard 都写到 `speedtune/rl/runs/<run_name>_<ts>/`.
+容器里也可以直接走 openpi venv 跑别的 openpi 脚本:
+
+```bash
+docker compose -f docker/compose.yml run --rm openpi_server bash
+# 容器里:
+/opt/venvs/openpi/bin/python -c "import openpi, flax, jax; print('ok')"
+```
 
 
 ## Step 5: 本机看日志 (可选)
 
 ```bash
-# 5a. 直接 ssh 进去 tail 日志
-ssh <user>@<云端IP> 'tmux a -t sac'
+# 5a. 直接 ssh 进去看 docker 日志
+ssh <user>@<云端IP> 'cd work/RoboTwin && docker compose -f docker/compose.yml logs -f robotwin_train'
 
 # 5b. 把云端 tensorboard 端口转发回本机
 ssh -N -f -L 6006:127.0.0.1:6006 <user>@<云端IP>
-# 云端先起 tensorboard
-ssh <user>@<云端IP> 'cd RoboTwin && tensorboard --logdir speedtune/rl/runs --port 6006'
+# 云端起 tensorboard (容器外, 直接读挂载的 runs/):
+ssh <user>@<云端IP> 'cd work/RoboTwin && tensorboard --logdir speedtune/rl/runs --port 6006'
 # 本机浏览器打开 http://127.0.0.1:6006
 ```
 
 
-## 如果要在本机小规模 dev (仍然让 pi0.5 在云端)
+## 如果要在本机小规模 dev (仍让 pi0.5 在云端)
 
-保留原来那套 SSH 端口转发方案即可, 本机跑 train.py 不需要改任何东西
-(`server_host=127.0.0.1` 会被转发到云端 8000):
+保留 SSH 端口转发方案, 本机 train.py 不需要改任何东西
+(默认 `server_host=127.0.0.1`):
 
 ```bash
+# 云端把 server 跑起来 (用上面 Step 3 的 compose 也行)
+# 本机:
 ssh -N -f -L 8000:localhost:8000 <user>@<云端IP>
 python -m speedtune.rl.train   # 本机 Sapien + 云端 pi0.5
 ```
-
-> 注: 本机模式下 RoboTwin sim 依然占本机 GPU. RoboTwin 任务小, 消费
-> GPU 主要是 Sapien 的渲染 (<2GB), 不推理 pi0.5, 本机 8GB 显存就够.
 
 
 ## 常用命令
