@@ -25,9 +25,9 @@ services:
   openpi_server:
     image: speedtune:latest
     build:
-      # 注意: context 是 RoboTwin 的父目录, 这样 Dockerfile 能同时 COPY
-      # openpi/ 和 RoboTwin/ 两个子目录
-      context: ..
+      # build context = RoboTwin 和 openpi 的共同父目录
+      # (compose 文件在 RoboTwin/docker/, .. = RoboTwin/, ../.. = parent/)
+      context: ../..
       dockerfile: RoboTwin/docker/speedtune.Dockerfile
     init: true
     tty: true
@@ -58,7 +58,7 @@ services:
     image: speedtune:latest
     # 复用 openpi_server 的 build; docker 会识别已构建的 image 不重建
     build:
-      context: ..
+      context: ../..
       dockerfile: RoboTwin/docker/speedtune.Dockerfile
     init: true
     tty: true

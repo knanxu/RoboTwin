@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # 统一开发/训练镜像: 一个容器同时装下两个项目的 venv
 #
 #   /app/openpi    pi0.5 推理        uv venv @ /opt/venvs/openpi   Python 3.11
@@ -109,16 +110,8 @@ WORKDIR /app
 
 # 两份源码的预期挂载点:  /app/openpi  /app/RoboTwin
 # entrypoint: 每次启动时若 RoboTwin 里没有 envs/curobo (被挂载覆盖), 建一个 symlink
-RUN mkdir -p /opt/bootstrap && cat > /opt/bootstrap/entrypoint.sh <<'EOF'
-#!/bin/bash
-set -e
-if [ -d /app/RoboTwin/envs ] && [ ! -e /app/RoboTwin/envs/curobo ]; then
-    ln -sfn /opt/curobo /app/RoboTwin/envs/curobo
-fi
-# 让 conda 激活命令可用 (后续 bash -lc 也能 source)
-source /opt/conda/etc/profile.d/conda.sh
-exec "$@"
-EOF
+RUN mkdir -p /opt/bootstrap
+COPY RoboTwin/docker/entrypoint.sh /opt/bootstrap/entrypoint.sh
 RUN chmod +x /opt/bootstrap/entrypoint.sh
 
 ENTRYPOINT ["/opt/bootstrap/entrypoint.sh"]
