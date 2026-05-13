@@ -22,102 +22,117 @@
 
 ```
 云端 GPU 主机
-└─ docker compose (docker/compose.yml), 一个 image 起两个容器:
-     ├─ openpi_server   [venv: /opt/venvs/openpi, py3.11]
-     │    serve_policy.py, 监听 0.0.0.0:8000
-     └─ robotwin_train  [venv: conda RoboTwin, py3.10]
-          speedtune/rl/train.py
-            └─ WebsocketClient(127.0.0.1:8000)  ← 宿主回环, 无额外延迟
-            └─ RoboTwin Sapien sim (headless, EGL)
-            └─ SAC on cuda
+└─ docker compose, 一个 image 起多个一次性/常驻容器:
+     ├─ collect         采 RoboTwin 专家数据 (Sapien, headless, conda RoboTwin)
+     ├─ convert         RoboTwin hdf5 → LeRobot v2.0  (openpi venv)
+     ├─ sft             pi0.5 drift SFT (openpi venv, compute_norm_stats + train_pytorch)
+     ├─ openpi_server   起 WebSocket 推理服务 (openpi venv)  [常驻]
+     └─ robotwin_train  SAC 训练 agent (conda RoboTwin)     [常驻]
 
 本机 (开发/监控)
-└─ ssh 进去看 tmux 日志 / 端口转发 tensorboard
+└─ ssh 进去看 docker logs / 端口转发 tensorboard
 ```
 
-两个容器共享同一个 image (`speedtune:latest`) —— image 里同时装了:
-- `/opt/venvs/openpi` (uv 管理, py3.11, flax/jax/torch)
-- `conda env RoboTwin` (py3.10, sapien/mplib/curobo/pytorch3d + websockets)
+同一个 image (`speedtune:latest`) 里同时装了:
+- uv venv `/opt/venvs/openpi` (py3.11, flax/jax/torch/lerobot)
+- conda env `RoboTwin` (py3.10, sapien/mplib/curobo/pytorch3d/websockets)
 
-各自激活各自的 venv 跑不同入口, 互不干扰.
-本机不跑推理, pi0.5 权重也不用下到本机. 云端 GPU ≥ 24GB.
-
-
-## Step 1: fork 仓库
-
-- fork **RoboTwin** (本仓库)
-- fork **openpi** 的带 drift model 和 `infer_with_hidden` 的分支
-
-两个 fork push 上去.
+所有 service 共用这个 image, 各自激活各自的 venv.
 
 
-## Step 2: 云端拉代码 + 放 checkpoint
+## 一把梭 (从零到 ckpt 到 RL 训练)
+
+**服务器上只需要装好 docker + nvidia-container-toolkit**, 其余全在容器里.
 
 ```bash
-# 要求两个仓库 side-by-side
+# 0) 克隆两个仓库 side-by-side
 mkdir -p ~/work && cd ~/work
 git clone <your-openpi-fork>.git openpi
 git -C openpi checkout <your-drifting-branch>
 git clone <your-RoboTwin-fork>.git RoboTwin
 
-# 放 checkpoint (默认挂到容器里的 /openpi_assets)
-mkdir -p ~/.cache/openpi/checkpoints
-# 把 ckpt 同步过来, 例如:
-#   ~/.cache/openpi/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999
+# 1) (可选) 如果你已经有 pi0.5 ckpt, 放到:
+#      ~/.cache/openpi/checkpoints/<policy_config>/<exp>/<step>/
+#    然后直接跑 runtime stage, 跳过 collect/convert/sft.
+#
+#    如果从零开始, 直接:
+cd ~/work/RoboTwin
+bash docker/run_pipeline.sh all
 ```
 
+`bash docker/run_pipeline.sh all` 会依次执行:
+1. `collect`  采 100 集 `shake_bottle` 专家 demo (几十分钟到几小时)
+2. `convert`  转成 LeRobot 格式到 `~/.cache/huggingface/lerobot/shake_bottle_drifting_repo`
+3. `sft`      在一张 GPU 上训 30k 步 pi0.5 drift (约 12-24 小时)
+4. `link`     把 ckpt 软链到 server 挂载点
+5. `runtime`  并发起 openpi_server + robotwin_train
 
-## Step 3: 一把起 server + 训练
+每一步也可以单独跑, 见下面 "分阶段调试".
+
+
+## 分阶段调试
 
 ```bash
 cd ~/work/RoboTwin
 
-# 选任务对应的 ckpt config
-export POLICY_CONFIG=pi05_aloha_robotwin_drifting_shake_bottle
-export POLICY_DIR=/openpi_assets/checkpoints/$POLICY_CONFIG/default/29999
+# 采集: 默认 task=shake_bottle, config=demo_clean
+bash docker/run_pipeline.sh collect shake_bottle demo_clean
 
-# 默认 server 和训练都拿 GPU 0; 两张卡就分开:
-# export OPENPI_GPU=0 ROBOTWIN_GPU=1
+# 数据转换 (hdf5 → LeRobot)
+bash docker/run_pipeline.sh convert shake_bottle demo_clean shake_bottle_drifting_repo
 
-docker compose -f docker/compose.yml up --build
-```
+# SFT (单卡)
+bash docker/run_pipeline.sh sft pi05_aloha_robotwin_drifting_shake_bottle default
 
-第一次 build 会装 flax/jax/torch/sapien/pytorch3d/curobo 等, 估计 20-40 分钟.
-后续启动 <1 分钟. server 会先起, `robotwin_train` 会轮询 `127.0.0.1:8000`
-通了才启动训练.
+# SFT (多卡, 2 张)
+NPROC_PER_NODE=2 SFT_GPU=0,1 \
+    bash docker/run_pipeline.sh sft pi05_aloha_robotwin_drifting_shake_bottle default
 
+# ckpt 软链 (把 openpi/checkpoints/<pol>/<exp>/<step> 链到 ~/.cache/openpi/checkpoints/)
+bash docker/run_pipeline.sh link pi05_aloha_robotwin_drifting_shake_bottle default 29999
 
-## Step 4: 调试 / 只起 server
+# 只起 server (前台, 方便看日志)
+bash docker/run_pipeline.sh serve pi05_aloha_robotwin_drifting_shake_bottle default 29999
 
-只起 server, 手动进训练容器跑:
+# 只起 RL 训练 (前提: server 已经起了)
+bash docker/run_pipeline.sh rl shake_bottle smoke_test
 
-```bash
-docker compose -f docker/compose.yml up --build openpi_server
-# 另开一个 shell
-docker compose -f docker/compose.yml run --rm robotwin_train bash
-# 容器里:
-conda activate RoboTwin
-python -m speedtune.rl.train --task_name shake_bottle --task_config smoke_test
-```
-
-容器里也可以直接走 openpi venv 跑别的 openpi 脚本:
-
-```bash
-docker compose -f docker/compose.yml run --rm openpi_server bash
-# 容器里:
-/opt/venvs/openpi/bin/python -c "import openpi, flax, jax; print('ok')"
+# server + RL 一起起
+bash docker/run_pipeline.sh runtime pi05_aloha_robotwin_drifting_shake_bottle default 29999
 ```
 
 
-## Step 5: 本机看日志 (可选)
+## 常用环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `TASK_NAME`         | `shake_bottle` | RoboTwin 任务名 |
+| `TASK_CONFIG`       | `demo_clean` | collect/convert 阶段的 task_config |
+| `RL_TASK_CONFIG`    | `smoke_test` | RL 训练/eval 阶段的 task_config |
+| `REPO_ID`           | `shake_bottle_drifting_repo` | LeRobot dataset repo_id, 必须和 openpi config 匹配 |
+| `EPISODE_NUM`       | `-1`  | convert 时取前 N 集, -1 = 全部 |
+| `POLICY_CONFIG`     | `pi05_aloha_robotwin_drifting_shake_bottle` | openpi train config 名 |
+| `EXP_NAME`          | `default` | SFT 实验名 (写到 ckpt 目录) |
+| `SFT_STEP`          | `29999` | serve/link 用哪一个 ckpt step |
+| `NPROC_PER_NODE`    | `1` | SFT 用几张 GPU (torchrun --nproc_per_node) |
+| `OPENPI_GPU`        | `0` | server 容器用哪张 GPU |
+| `ROBOTWIN_GPU`      | `0` | RL 训练容器用哪张 GPU |
+| `SFT_GPU`           | `0` | SFT 容器用哪张 GPU (多卡: `0,1`) |
+| `COLLECT_GPU`       | `0` | collect 容器用哪张 GPU |
+| `OPENPI_DATA_HOME`  | `~/.cache/openpi` | 宿主放 ckpt/norm stats 的目录, 挂到 `/openpi_assets` |
+| `LEROBOT_HOME`      | `~/.cache/huggingface/lerobot` | 宿主放 LeRobot dataset 的目录 |
+| `TOTAL_ENV_STEPS`   | `50000` | RL 训练总步数 |
+| `WARMUP_STEPS`      | `1000`  | RL 随机 warmup 步数 |
+
+
+## 本机看日志 / TensorBoard (可选)
 
 ```bash
-# 5a. 直接 ssh 进去看 docker 日志
+# 看某个 service 日志
 ssh <user>@<云端IP> 'cd work/RoboTwin && docker compose -f docker/compose.yml logs -f robotwin_train'
 
-# 5b. 把云端 tensorboard 端口转发回本机
+# TensorBoard 端口转发 (在容器外宿主起, 直接读挂载的 runs/)
 ssh -N -f -L 6006:127.0.0.1:6006 <user>@<云端IP>
-# 云端起 tensorboard (容器外, 直接读挂载的 runs/):
 ssh <user>@<云端IP> 'cd work/RoboTwin && tensorboard --logdir speedtune/rl/runs --port 6006'
 # 本机浏览器打开 http://127.0.0.1:6006
 ```
@@ -129,8 +144,10 @@ ssh <user>@<云端IP> 'cd work/RoboTwin && tensorboard --logdir speedtune/rl/run
 (默认 `server_host=127.0.0.1`):
 
 ```bash
-# 云端把 server 跑起来 (用上面 Step 3 的 compose 也行)
-# 本机:
+# 云端
+bash docker/run_pipeline.sh serve pi05_aloha_robotwin_drifting_shake_bottle default 29999
+
+# 本机
 ssh -N -f -L 8000:localhost:8000 <user>@<云端IP>
 python -m speedtune.rl.train   # 本机 Sapien + 云端 pi0.5
 ```

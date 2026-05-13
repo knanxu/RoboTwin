@@ -74,6 +74,9 @@ RUN $OPENPI_VENV/bin/python -c \
         | xargs -I{} cp -r /tmp/openpi_tr_replace/. {}/ && \
     rm -rf /tmp/openpi_tr_replace /tmp/openpi_build
 
+# Extras for tools/convert_robotwin_to_lerobot.py (reads RoboTwin hdf5)
+RUN $OPENPI_VENV/bin/pip install --no-cache-dir h5py tqdm
+
 # ------------------------------------------------------------------
 # 4. RoboTwin conda env (Python 3.10)
 # ------------------------------------------------------------------

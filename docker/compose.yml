@@ -1,65 +1,181 @@
-# 一个 image, 两个 service: openpi server + RoboTwin 训练
+# 同 image, 多 service: 覆盖 "采集 → 转换 → SFT → 推理 server → RL 训练" 全流程
 #
 # 前置:
 #   parent/
-#     ├── openpi/       <- drift branch, 有 infer_with_hidden
-#     └── RoboTwin/     <- 本仓库, 你在这里起 compose
+#     ├── openpi/       <- drift branch, 含 infer_with_hidden
+#     └── RoboTwin/     <- 本仓库, 在这里起 compose
+#   docker + nvidia-container-toolkit 已装.
 #
-#   pi0.5 checkpoint 放到宿主:
-#     ${OPENPI_DATA_HOME:-~/.cache/openpi}/checkpoints/<policy_config>/default/<step>
+# 常用命令 (在 RoboTwin 目录下):
+#   bash docker/run_pipeline.sh all                        # 一把梭
+#   bash docker/run_pipeline.sh collect shake_bottle demo_clean 100
+#   bash docker/run_pipeline.sh convert shake_bottle demo_clean shake_bottle_drifting_repo
+#   bash docker/run_pipeline.sh sft pi05_aloha_robotwin_drifting_shake_bottle default
+#   bash docker/run_pipeline.sh serve pi05_aloha_robotwin_drifting_shake_bottle default 29999
+#   bash docker/run_pipeline.sh rl shake_bottle smoke_test
 #
-# 起:
-#   cd RoboTwin
-#   export POLICY_CONFIG=pi05_aloha_robotwin_drifting_shake_bottle
-#   export POLICY_DIR=/openpi_assets/checkpoints/$POLICY_CONFIG/default/29999
-#   docker compose -f docker/compose.yml up --build
+# compose --profile 机制:
+#   docker compose -f docker/compose.yml --profile collect  run --rm collect
+#   docker compose -f docker/compose.yml --profile convert  run --rm convert
+#   docker compose -f docker/compose.yml --profile sft      run --rm sft
+#   docker compose -f docker/compose.yml --profile runtime  up --build
 #
-# 只起 server 手动进 train 容器调试:
-#   docker compose -f docker/compose.yml up --build openpi_server
-#   docker compose -f docker/compose.yml run --rm robotwin_train bash
-#
-# 分卡 (2 张):
-#   OPENPI_GPU=0 ROBOTWIN_GPU=1 docker compose -f docker/compose.yml up --build
+# 分卡:
+#   OPENPI_GPU=0 ROBOTWIN_GPU=1  (RL 训练与 server 分卡)
+#   SFT_GPU=0,1                  (SFT 多卡)
+
+x-common-build: &common-build
+  context: ../..
+  dockerfile: RoboTwin/docker/speedtune.Dockerfile
+
+x-common-volumes: &common-volumes
+  - ../../openpi:/app/openpi
+  - ../:/app/RoboTwin
+  # 专家数据 (RoboTwin 采集输出) — 默认落到 RoboTwin/data, 已经在 ../:/app/RoboTwin 里挂好
+  # pi0.5 checkpoint / norm stats / lerobot 数据
+  - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+  - ${LEROBOT_HOME:-~/.cache/huggingface/lerobot}:/root/.cache/huggingface/lerobot
+
+x-gpu-deploy: &gpu-deploy
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          capabilities: [gpu]
 
 services:
+
+  # ========================================================================
+  # Stage 1: 采集 RoboTwin 专家数据 (hdf5)
+  # ========================================================================
+  collect:
+    image: speedtune:latest
+    build: *common-build
+    profiles: ["collect", "all"]
+    init: true
+    tty: true
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${COLLECT_GPU:-0}"
+      PYOPENGL_PLATFORM: egl
+      TASK_NAME: "${TASK_NAME:-shake_bottle}"
+      TASK_CONFIG: "${TASK_CONFIG:-demo_clean}"
+    volumes: *common-volumes
+    working_dir: /app/RoboTwin
+    command: >
+      bash -lc '
+        set -e
+        source /opt/conda/etc/profile.d/conda.sh
+        conda activate RoboTwin
+        cd /app/RoboTwin
+        echo "[collect] task=$${TASK_NAME} config=$${TASK_CONFIG}"
+        python script/collect_data.py "$${TASK_NAME}" "$${TASK_CONFIG}"
+      '
+    deploy: *gpu-deploy
+
+  # ========================================================================
+  # Stage 2: RoboTwin hdf5 → LeRobot v2.0
+  # ========================================================================
+  convert:
+    image: speedtune:latest
+    build: *common-build
+    profiles: ["convert", "all"]
+    init: true
+    tty: true
+    environment:
+      TASK_NAME: "${TASK_NAME:-shake_bottle}"
+      TASK_CONFIG: "${TASK_CONFIG:-demo_clean}"
+      REPO_ID: "${REPO_ID:-shake_bottle_drifting_repo}"
+      EPISODE_NUM: "${EPISODE_NUM:--1}"
+      TASK_PROMPT: "${TASK_PROMPT:-}"
+    volumes: *common-volumes
+    working_dir: /app/RoboTwin
+    command: >
+      bash -lc '
+        set -e
+        cd /app/RoboTwin
+        echo "[convert] task=$${TASK_NAME} config=$${TASK_CONFIG} repo_id=$${REPO_ID}"
+        /opt/venvs/openpi/bin/python tools/convert_robotwin_to_lerobot.py \
+          --raw-root /app/RoboTwin/data \
+          --task-name "$${TASK_NAME}" \
+          --task-config "$${TASK_CONFIG}" \
+          --episode-num "$${EPISODE_NUM}" \
+          --repo-id "$${REPO_ID}" \
+          --task-prompt "$${TASK_PROMPT:-}"
+      '
+
+  # ========================================================================
+  # Stage 3: SFT (pi0.5 drift). 单卡 / 多卡都支持
+  # ========================================================================
+  sft:
+    image: speedtune:latest
+    build: *common-build
+    profiles: ["sft", "all"]
+    init: true
+    tty: true
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${SFT_GPU:-0}"
+      POLICY_CONFIG: "${POLICY_CONFIG:-pi05_aloha_robotwin_drifting_shake_bottle}"
+      EXP_NAME: "${EXP_NAME:-default}"
+      NPROC_PER_NODE: "${NPROC_PER_NODE:-1}"
+      OPENPI_DATA_HOME: /openpi_assets
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+    volumes: *common-volumes
+    working_dir: /app/openpi
+    command: >
+      bash -lc '
+        set -e
+        cd /app/openpi
+        PY=/opt/venvs/openpi/bin/python
+        # 1) 算 norm stats
+        echo "[sft] computing norm stats for $${POLICY_CONFIG}"
+        $$PY scripts/compute_norm_stats.py --config-name "$${POLICY_CONFIG}"
+        # 2) 训练
+        if [ "$${NPROC_PER_NODE}" = "1" ]; then
+          echo "[sft] single-GPU PyTorch training"
+          $$PY scripts/train_pytorch.py "$${POLICY_CONFIG}" --exp_name "$${EXP_NAME}"
+        else
+          echo "[sft] multi-GPU PyTorch training on $${NPROC_PER_NODE} GPUs"
+          /opt/venvs/openpi/bin/torchrun --standalone --nnodes=1 \
+              --nproc_per_node=$${NPROC_PER_NODE} \
+              scripts/train_pytorch.py "$${POLICY_CONFIG}" --exp_name "$${EXP_NAME}"
+        fi
+      '
+    deploy: *gpu-deploy
+
+  # ========================================================================
+  # Stage 4: pi0.5 推理 server (WebSocket, infer_with_hidden)
+  # ========================================================================
   openpi_server:
     image: speedtune:latest
-    build:
-      # build context = RoboTwin 和 openpi 的共同父目录
-      # (compose 文件在 RoboTwin/docker/, .. = RoboTwin/, ../.. = parent/)
-      context: ../..
-      dockerfile: RoboTwin/docker/speedtune.Dockerfile
+    build: *common-build
+    profiles: ["runtime", "serve", "all"]
     init: true
     tty: true
     network_mode: host
     environment:
-      SERVER_ARGS: "--port 8000 policy:checkpoint --policy.config=${POLICY_CONFIG:-pi05_aloha_robotwin_drifting_shake_bottle} --policy.dir=${POLICY_DIR:-/openpi_assets/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999}"
+      NVIDIA_VISIBLE_DEVICES: "${OPENPI_GPU:-0}"
       OPENPI_DATA_HOME: /openpi_assets
       IS_DOCKER: "true"
-      NVIDIA_VISIBLE_DEVICES: "${OPENPI_GPU:-0}"
-    volumes:
-      - ../../openpi:/app/openpi
-      - ../:/app/RoboTwin
-      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      SERVER_ARGS: >-
+        --port 8000 policy:checkpoint
+        --policy.config=${POLICY_CONFIG:-pi05_aloha_robotwin_drifting_shake_bottle}
+        --policy.dir=${POLICY_DIR:-/openpi_assets/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999}
+    volumes: *common-volumes
     working_dir: /app/openpi
     command: >
       bash -lc '
         cd /app/openpi
         /opt/venvs/openpi/bin/python scripts/serve_policy.py $${SERVER_ARGS}
       '
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
+    deploy: *gpu-deploy
 
+  # ========================================================================
+  # Stage 5: SAC 训练 agent (等 server 通了才启动)
+  # ========================================================================
   robotwin_train:
     image: speedtune:latest
-    # 复用 openpi_server 的 build; docker 会识别已构建的 image 不重建
-    build:
-      context: ../..
-      dockerfile: RoboTwin/docker/speedtune.Dockerfile
+    build: *common-build
+    profiles: ["runtime", "rl", "all"]
     init: true
     tty: true
     stdin_open: true
@@ -68,6 +184,7 @@ services:
       - openpi_server
     environment:
       NVIDIA_VISIBLE_DEVICES: "${ROBOTWIN_GPU:-0}"
+      PYOPENGL_PLATFORM: egl
       SERVER_HOST: "127.0.0.1"
       SERVER_PORT: "8000"
       TASK_NAME: "${TASK_NAME:-shake_bottle}"
@@ -75,9 +192,7 @@ services:
       TOTAL_ENV_STEPS: "${TOTAL_ENV_STEPS:-50000}"
       WARMUP_STEPS: "${WARMUP_STEPS:-1000}"
       EXTRA_TRAIN_ARGS: "${EXTRA_TRAIN_ARGS:-}"
-    volumes:
-      - ../../openpi:/app/openpi
-      - ../:/app/RoboTwin
+    volumes: *common-volumes
     working_dir: /app/RoboTwin
     command: >
       bash -lc '
@@ -101,9 +216,4 @@ services:
           --warmup_steps "$${WARMUP_STEPS}" \
           $${EXTRA_TRAIN_ARGS}
       '
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
+    deploy: *gpu-deploy
