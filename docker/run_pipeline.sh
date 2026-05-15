@@ -4,6 +4,7 @@
 # 所有阶段都走 docker compose, 你的宿主机只需要 docker + nvidia-container-toolkit.
 #
 # Stages:
+#   build     一次性 build image (强烈推荐先单独跑这一步, 见下文)
 #   collect   采集 RoboTwin 专家数据 (hdf5)
 #   convert   RoboTwin hdf5 -> LeRobot v2.0 (供 openpi 训练)
 #   sft       pi0.5 drift SFT (先 compute_norm_stats, 再 train_pytorch)
@@ -12,6 +13,13 @@
 #   rl        跑 SAC 加速 agent
 #   runtime   serve + rl 一起起 (等价 docker compose --profile runtime up)
 #   all       collect + convert + sft + link + runtime 一条龙
+#
+# 重要: 第一次用先单独 build, 不要直接 `docker compose --profile all build`.
+# 那样会让 6 个 service 并行 build 6 次, 网络更容易撞限流.
+# 用:
+#   bash docker/run_pipeline.sh build
+# 或者直接:
+#   docker compose -f docker/compose.yml build openpi_server
 #
 # Examples:
 #   # 如果你已经有 pi0.5 ckpt, 想直接跑 RL:
@@ -52,6 +60,13 @@ log() { echo -e "\033[1;34m[$(date +%H:%M:%S)] $*\033[0m"; }
 usage() {
     grep -E '^#' "$0" | sed 's/^# \{0,1\}//'
     exit 1
+}
+
+stage_build() {
+    # 单独 build 一次 image. 复用一个 service 的 build spec 就够了
+    # (所有 service 共用 speedtune:latest), 避免 --profile all 并行 build.
+    log "build    speedtune:latest (single pass)"
+    $DC build openpi_server "$@"
 }
 
 stage_collect() {
@@ -139,6 +154,7 @@ stage_all() {
 cmd="$1"; shift || true
 
 case "$cmd" in
+    build)   stage_build "$@" ;;
     collect) stage_collect "$@" ;;
     convert) stage_convert "$@" ;;
     sft)     stage_sft "$@" ;;
