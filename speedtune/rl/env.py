@@ -9,6 +9,12 @@ Gym Env: 把 RoboTwin + 远端 pi0.5 包装成一个 SAC 可以训的环境.
       5. obs' = pool(下次推理 cond_emb) + last_action + cnt 进度 + last_fallback
   - 一个 episode = 一次 setup_demo, 跑到 success / truncated / 物理崩溃.
   - pi0.5 推理在云端 GPU 跑, 本机只跑 RoboTwin sim + SAC.
+
+Episode-level 计时 (对齐 speedtune/tests/smoke_replay_expert.py 的口径):
+  - ``_episode_wall_time``: 从 reset 后第一次 step 进入到当前的累计 wall time.
+  - ``_episode_obs_time``:  RoboTwin 内部成功分支里 get_obs() (图像渲染) 的耗时,
+                            需要从 wall_time 里剔除才是 "真实 episode 执行时间".
+  - ``_episode_wall_time_no_obs = _episode_wall_time - _episode_obs_time``.
 """
 from __future__ import annotations
 
@@ -16,6 +22,7 @@ import importlib
 import os
 import random
 import sys
+import time
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -88,8 +95,13 @@ class ChunkSpeedupEnv:
         self._last_fallback = 0.0
         self._latest_cond_emb = None   # 上次 pi0.5 推理 pool 后 (cond_emb_dim,)
         self._latest_chunk = None      # 上次推理出的 chunk (T, action_dim)
-        self._episode_total_time = 0.0   # 累计 chunk duration
+        self._episode_total_time = 0.0   # 累计 chunk TOPPRA duration (秒, 仿真物理时间)
         self._episode_step_count = 0
+        # wall-clock 计时 (对齐 smoke_replay_expert 口径)
+        self._episode_wall_t0 = None         # reset 后第一次 step 进入的 perf_counter
+        self._episode_obs_time = 0.0         # 累计 success 分支里 get_obs() 的耗时
+        self._episode_wall_time = 0.0        # 当前累计 wall time
+        self._episode_wall_time_no_obs = 0.0 # wall_time - obs_time
 
         # pi0.5 远端 client (lazy 创建, 因为云端 server 可能晚启动)
         from openpi_client import websocket_client_policy as _ws  # noqa: E402
@@ -270,6 +282,13 @@ class ChunkSpeedupEnv:
         self._last_fallback = 0.0
         self._episode_total_time = 0.0
         self._episode_step_count = 0
+        # wall-clock 计时: 重置
+        self._episode_wall_t0 = None
+        self._episode_obs_time = 0.0
+        self._episode_wall_time = 0.0
+        self._episode_wall_time_no_obs = 0.0
+        # 重置 RoboTwin 内部的 success obs 计时器
+        self._task_env._last_success_obs_time = 0.0
 
         return self._assemble_state(cond), {"seed": next_seed, "instruction": instruction}
 
@@ -280,12 +299,17 @@ class ChunkSpeedupEnv:
 
         info: Dict[str, Any] = {"action": action.tolist()}
 
+        # 开始计时 (第一次 step 时启动)
+        if self._episode_wall_t0 is None:
+            self._episode_wall_t0 = time.perf_counter()
+
         try:
             chunk_info = self._task_env.take_chunk_action(
                 chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
             )
         except Exception as e:
             info["error"] = repr(e)
+            self._finalize_wall_time()
             return (
                 self._assemble_state(self._latest_cond_emb),
                 self.reward_cfg.crash_penalty,
@@ -297,6 +321,8 @@ class ChunkSpeedupEnv:
         info["chunk_info"] = chunk_info
         self._episode_step_count += 1
         self._episode_total_time += float(chunk_info.get("duration", 0.0))
+        # 累计本 chunk 内 success 分支的 get_obs 耗时 (从 take_chunk_action info 取)
+        self._episode_obs_time += float(chunk_info.get("success_obs_time", 0.0))
 
         status = chunk_info["status"]
         is_fallback = status == "topp_fallback"
@@ -323,6 +349,11 @@ class ChunkSpeedupEnv:
         self._last_fallback = 1.0 if is_fallback else 0.0
 
         if terminated or truncated:
+            self._finalize_wall_time()
+            info["episode_wall_time"] = self._episode_wall_time
+            info["episode_obs_time"] = self._episode_obs_time
+            info["episode_wall_time_no_obs"] = self._episode_wall_time_no_obs
+            info["episode_total_topp_time"] = self._episode_total_time
             return self._assemble_state(self._latest_cond_emb), reward, terminated, truncated, info
 
         # ---- 推下一段 ----
@@ -330,6 +361,7 @@ class ChunkSpeedupEnv:
             chunk, cond = self._infer_pi()
         except Exception as e:
             info["error"] = f"pi05 infer failed: {e!r}"
+            self._finalize_wall_time()
             return (
                 self._assemble_state(self._latest_cond_emb),
                 self.reward_cfg.crash_penalty,
@@ -342,6 +374,24 @@ class ChunkSpeedupEnv:
         self._chunk_idx += 1
 
         return self._assemble_state(cond), reward, False, False, info
+
+    def _finalize_wall_time(self):
+        """在 episode 结束时把 wall-clock 时间 / obs 排除值算清楚."""
+        if self._episode_wall_t0 is not None:
+            self._episode_wall_time = max(
+                0.0, time.perf_counter() - self._episode_wall_t0
+            )
+        else:
+            self._episode_wall_time = 0.0
+        # 兜底: take_chunk_action 里 success 分支也会把当次的 obs_time 累到 self._episode_obs_time;
+        # 但 take_action 路径 / per-frame 路径用的是 task_env._last_success_obs_time,
+        # 这里再合并一次, 避免漏算.
+        last_obs = float(getattr(self._task_env, "_last_success_obs_time", 0.0))
+        if last_obs > self._episode_obs_time:
+            self._episode_obs_time = last_obs
+        self._episode_wall_time_no_obs = max(
+            0.0, self._episode_wall_time - self._episode_obs_time
+        )
 
     def close(self):
         if self._task_env is not None:

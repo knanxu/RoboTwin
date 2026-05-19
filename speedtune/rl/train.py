@@ -49,28 +49,49 @@ def _override_config(cfg: FullConfig, args: argparse.Namespace) -> FullConfig:
 
 
 def _eval(env: ChunkSpeedupEnv, agent: SAC, n_episodes: int) -> dict:
-    successes, ep_lens, ep_returns, ep_times = [], [], [], []
+    """Run ``n_episodes`` deterministic rollouts and aggregate metrics.
+
+    Reports three things:
+      - success rate over all eval episodes
+      - mean episode reward (cumulative discounted-free sum)
+      - mean wall-clock execution time of *successful* episodes only,
+        with the success-branch get_obs() rendering cost subtracted out
+        (so it reflects the controllable execution time, not Sapien's
+        post-success snapshot work). Mirrors the wall_time_no_obs accounting
+        in speedtune/tests/smoke_replay_expert.py.
+    """
+    successes = []
+    ep_returns = []
+    success_wall_times = []   # 仅成功 episode 的 (wall_time - obs_time)
     for _ in range(n_episodes):
         obs, _ = env.reset()
         done = False
         ret = 0.0
-        steps = 0
+        last_info: dict = {}
         while not done:
             action = agent.select_action(obs, deterministic=True)
             obs, r, terminated, truncated, info = env.step(action)
             ret += r
-            steps += 1
+            last_info = info
             done = terminated or truncated
-        successes.append(float(info.get("success", False)))
-        ep_lens.append(steps)
+        is_success = bool(last_info.get("success", False))
+        successes.append(float(is_success))
         ep_returns.append(ret)
-        ep_times.append(float(env._episode_total_time))
-    return {
-        "eval/success_rate": float(np.mean(successes)),
-        "eval/return": float(np.mean(ep_returns)),
-        "eval/ep_chunks": float(np.mean(ep_lens)),
-        "eval/ep_total_time_s": float(np.mean(ep_times)),
+        if is_success:
+            wall_no_obs = float(last_info.get("episode_wall_time_no_obs", 0.0))
+            success_wall_times.append(wall_no_obs)
+
+    metrics = {
+        "eval/success_rate": float(np.mean(successes)) if successes else 0.0,
+        "eval/return": float(np.mean(ep_returns)) if ep_returns else 0.0,
+        "eval/n_success": int(sum(successes)),
+        "eval/n_episodes": int(len(successes)),
     }
+    if success_wall_times:
+        metrics["eval/success_wall_time_no_obs_s"] = float(np.mean(success_wall_times))
+        metrics["eval/success_wall_time_no_obs_min_s"] = float(np.min(success_wall_times))
+        metrics["eval/success_wall_time_no_obs_max_s"] = float(np.max(success_wall_times))
+    return metrics
 
 
 def main():
@@ -129,10 +150,10 @@ def main():
 
     obs, _ = env.reset(seed=cfg.train.seed)
     ep_return = 0.0
-    ep_len = 0
     ep_returns = deque(maxlen=20)
-    ep_lens = deque(maxlen=20)
     ep_successes = deque(maxlen=20)
+    # 只统计成功 episode 的 wall_time_no_obs (对齐 smoke_replay_expert 的口径)
+    success_wall_times = deque(maxlen=20)
 
     start = time.time()
     for step in range(1, cfg.train.total_env_steps + 1):
@@ -147,15 +168,17 @@ def main():
         agent.buffer.add(obs, action, reward, next_obs, done_for_buffer)
 
         ep_return += reward
-        ep_len += 1
         obs = next_obs
 
         if terminated or truncated:
             ep_returns.append(ep_return)
-            ep_lens.append(ep_len)
-            ep_successes.append(float(info.get("success", False)))
+            is_success = bool(info.get("success", False))
+            ep_successes.append(float(is_success))
+            if is_success:
+                success_wall_times.append(
+                    float(info.get("episode_wall_time_no_obs", 0.0))
+                )
             ep_return = 0.0
-            ep_len = 0
             obs, _ = env.reset()
 
         # 学习
@@ -169,18 +192,24 @@ def main():
         if step % cfg.train.log_every == 0:
             elapsed = time.time() - start
             avg_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
-            avg_len = float(np.mean(ep_lens)) if ep_lens else float("nan")
             avg_sr = float(np.mean(ep_successes)) if ep_successes else float("nan")
+            avg_succ_wall = (
+                float(np.mean(success_wall_times)) if success_wall_times else float("nan")
+            )
             print(
                 f"[step {step}/{cfg.train.total_env_steps}] "
-                f"ep_ret={avg_ret:.3f} ep_len={avg_len:.1f} sr={avg_sr:.2f} "
+                f"ep_ret={avg_ret:.3f} sr={avg_sr:.2f} "
+                f"succ_wall(s)={avg_succ_wall:.2f} (n={len(success_wall_times)}) "
                 f"buf={len(agent.buffer)} elapsed={elapsed:.0f}s",
                 flush=True,
             )
             if writer is not None:
                 writer.add_scalar("rollout/ep_return", avg_ret, step)
-                writer.add_scalar("rollout/ep_len", avg_len, step)
                 writer.add_scalar("rollout/success_rate", avg_sr, step)
+                if success_wall_times:
+                    writer.add_scalar(
+                        "rollout/success_wall_time_no_obs_s", avg_succ_wall, step
+                    )
 
         if step % cfg.train.eval_every == 0 and step > cfg.sac.warmup_steps:
             print(f"[eval] step {step} ...", flush=True)
