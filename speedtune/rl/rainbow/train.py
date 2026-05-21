@@ -1,10 +1,13 @@
-"""Rainbow DQN training entry point.
+"""Rainbow DQN training entry point with Weights & Biases logging.
 
 Usage:
     cd ~/RoboTwin
     python -m speedtune.rl.rainbow.train \
         --task_name shake_bottle --task_config demo_clean \
         --server_host 127.0.0.1 --server_port 8000
+
+    # Disable wandb (offline / no account):
+    python -m speedtune.rl.rainbow.train ... --wandb_enabled false
 
 The env wrapper, reward shape, and timing accounting are reused from the
 SAC variant (speedtune.rl.env.ChunkSpeedupEnv). Only the agent differs.
@@ -65,8 +68,6 @@ def _override_config(cfg: FullConfig, args: argparse.Namespace) -> FullConfig:
 
 
 def _to_sac_action_space(cfg: FullConfig):
-    """Pull (low, high) bounds from the discrete grids so ChunkSpeedupEnv
-    can still clamp / record `last_action` consistently."""
     grids = cfg.action_grid
     return _SACActionSpaceConfig(
         v_low=float(grids.v_grid[0]),
@@ -134,21 +135,20 @@ def _eval(env: ChunkSpeedupEnv, agent: RainbowAgent, env_step: int, n_episodes: 
                 float(last_info.get("episode_wall_time_no_obs", 0.0))
             )
     metrics = {
-        "eval/success_rate": float(np.mean(successes)) if successes else 0.0,
-        "eval/return": float(np.mean(ep_returns)) if ep_returns else 0.0,
-        "eval/n_success": int(sum(successes)),
-        "eval/n_episodes": int(len(successes)),
+        "evaluation/task_success_rate": float(np.mean(successes)) if successes else 0.0,
+        "evaluation/episode_cumulative_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
+        "evaluation/number_of_successful_episodes": int(sum(successes)),
+        "evaluation/total_evaluation_episodes": int(len(successes)),
     }
     if success_wall_times:
-        metrics["eval/success_wall_time_no_obs_s"] = float(np.mean(success_wall_times))
-        metrics["eval/success_wall_time_no_obs_min_s"] = float(np.min(success_wall_times))
-        metrics["eval/success_wall_time_no_obs_max_s"] = float(np.max(success_wall_times))
+        metrics["evaluation/successful_episode_execution_time_mean_seconds"] = float(np.mean(success_wall_times))
+        metrics["evaluation/successful_episode_execution_time_min_seconds"] = float(np.min(success_wall_times))
+        metrics["evaluation/successful_episode_execution_time_max_seconds"] = float(np.max(success_wall_times))
     return metrics
 
 
 def main():
     parser = argparse.ArgumentParser()
-    # Same overrides surface as the SAC trainer for muscle memory.
     parser.add_argument("--task_name", type=str, default=None)
     parser.add_argument("--task_config", type=str, default=None)
     parser.add_argument("--server_host", type=str, default=None)
@@ -168,6 +168,10 @@ def main():
     parser.add_argument("--v_min", type=float, default=None)
     parser.add_argument("--v_max", type=float, default=None)
     parser.add_argument("--n_step", type=int, default=None)
+    # wandb
+    parser.add_argument("--wandb_project", type=str, default="speedtune-rainbow")
+    parser.add_argument("--wandb_enabled", type=str, default="true",
+                        help="Set to 'false' to disable wandb logging")
     args = parser.parse_args()
 
     cfg = FullConfig()
@@ -179,6 +183,28 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     print(f"[train] run dir: {run_dir}", flush=True)
 
+    # ---- wandb init ----
+    wandb_enabled = args.wandb_enabled.lower() not in ("false", "0", "no", "off")
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
+        wandb_enabled = False
+
+    if wandb_enabled and wandb is not None:
+        wandb.init(
+            project=args.wandb_project,
+            name=f"{cfg.train.run_name}_{cfg.env.task_name}",
+            config=asdict(cfg),
+            dir=run_dir,
+        )
+        print(f"[wandb] logging to project '{args.wandb_project}'", flush=True)
+    else:
+        if wandb is not None:
+            wandb.init(mode="disabled")
+        print("[wandb] disabled", flush=True)
+
+    # ---- tensorboard (保留作为本地备用) ----
     try:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=run_dir)
@@ -226,13 +252,10 @@ def main():
     rcfg = cfg.rainbow
     beta_steps = max(1, rcfg.per_beta_steps)
     for step in range(1, cfg.train.total_env_steps + 1):
-        # PER β annealing toward 1.0
         frac = min(1.0, step / beta_steps)
         beta = rcfg.per_beta_start + frac * (rcfg.per_beta_end - rcfg.per_beta_start)
 
         if step <= rcfg.warmup_steps:
-            # Random discrete actions during warmup so the buffer sees
-            # a diverse set of (v, vs, as) before learning starts.
             idx = np.array(
                 [np.random.randint(K) for K in K_tuple],
                 dtype=np.int64,
@@ -261,15 +284,35 @@ def main():
             ep_return = 0.0
             obs, _ = env.reset()
 
+        # ---- learning ----
         if len(agent.buffer) >= rcfg.batch_size and step > rcfg.warmup_steps:
             for _ in range(rcfg.updates_per_step):
-                metrics = agent.update(beta=beta)
-            if writer is not None and step % cfg.train.log_every == 0:
-                for k, v in metrics.items():
-                    writer.add_scalar(f"train/{k}", v, step)
-                writer.add_scalar("train/epsilon", agent.epsilon(step), step)
-                writer.add_scalar("train/per_beta", beta, step)
+                train_metrics = agent.update(beta=beta)
 
+            if step % cfg.train.log_every == 0:
+                # Wandb: training losses and hyperparams
+                # 全称命名:
+                #   training/total_distributional_loss         - 三维 C51 cross-entropy 之和
+                #   training/critic_loss_dimension_v           - v 维度的 C51 cross-entropy
+                #   training/critic_loss_dimension_vel_scale   - vel_scale 维度
+                #   training/critic_loss_dimension_acc_scale   - acc_scale 维度
+                #   training/epsilon_greedy_probability        - 当前 ε
+                #   training/prioritized_replay_beta           - PER importance-sampling β
+                wandb_train = {
+                    "training/total_distributional_loss": train_metrics["loss_total"],
+                    "training/critic_loss_dimension_v": train_metrics["loss_dim0"],
+                    "training/critic_loss_dimension_vel_scale": train_metrics["loss_dim1"],
+                    "training/critic_loss_dimension_acc_scale": train_metrics["loss_dim2"],
+                    "training/epsilon_greedy_probability": agent.epsilon(step),
+                    "training/prioritized_replay_beta": beta,
+                }
+                if wandb_enabled and wandb is not None:
+                    wandb.log(wandb_train, step=step)
+                if writer is not None:
+                    for k, v in wandb_train.items():
+                        writer.add_scalar(k, v, step)
+
+        # ---- stdout + rollout logging ----
         if step % cfg.train.log_every == 0:
             elapsed = time.time() - start
             avg_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
@@ -285,28 +328,64 @@ def main():
                 f"elapsed={elapsed:.0f}s",
                 flush=True,
             )
-            if writer is not None:
-                writer.add_scalar("rollout/ep_return", avg_ret, step)
-                writer.add_scalar("rollout/success_rate", avg_sr, step)
-                if success_wall_times:
-                    writer.add_scalar(
-                        "rollout/success_wall_time_no_obs_s", avg_succ_wall, step
-                    )
 
-        if step % cfg.train.eval_every == 0 and step > rcfg.warmup_steps:
-            print(f"[eval] step {step} ...", flush=True)
-            metrics = _eval(env, agent, env_step=step, n_episodes=cfg.train.eval_episodes)
-            print(f"[eval] {metrics}", flush=True)
+            # Wandb: rollout metrics
+            # 全称命名:
+            #   rollout/episode_cumulative_return             - 最近 20 episode 的平均累计 reward
+            #   rollout/task_success_rate                     - 最近 20 episode 成功率
+            #   rollout/successful_episode_execution_time_seconds
+            #       - 最近 20 个成功 episode 的平均执行时间 (去除渲染耗时)
+            #   rollout/replay_buffer_size                    - buffer 当前条数
+            rollout_log = {
+                "rollout/episode_cumulative_return": avg_ret,
+                "rollout/task_success_rate": avg_sr,
+                "rollout/replay_buffer_size": float(len(agent.buffer)),
+            }
+            if success_wall_times:
+                rollout_log["rollout/successful_episode_execution_time_seconds"] = avg_succ_wall
+            if wandb_enabled and wandb is not None:
+                wandb.log(rollout_log, step=step)
             if writer is not None:
-                for k, v in metrics.items():
+                for k, v in rollout_log.items():
                     writer.add_scalar(k, v, step)
 
+        # ---- evaluation ----
+        if step % cfg.train.eval_every == 0 and step > rcfg.warmup_steps:
+            print(f"[eval] step {step} ...", flush=True)
+            eval_metrics = _eval(env, agent, env_step=step, n_episodes=cfg.train.eval_episodes)
+            print(f"[eval] {eval_metrics}", flush=True)
+
+            # Wandb: eval metrics
+            # 全称命名:
+            #   evaluation/task_success_rate
+            #       - eval episodes 中任务成功的比例
+            #   evaluation/episode_cumulative_return
+            #       - eval episodes 的平均累计 reward
+            #   evaluation/number_of_successful_episodes
+            #       - eval 中成功的 episode 数量
+            #   evaluation/total_evaluation_episodes
+            #       - eval 总 episode 数量
+            #   evaluation/successful_episode_execution_time_mean_seconds
+            #       - 成功 episode 的平均真实执行时间 (排除成功帧渲染耗时)
+            #   evaluation/successful_episode_execution_time_min_seconds
+            #       - 成功 episode 中最短执行时间
+            #   evaluation/successful_episode_execution_time_max_seconds
+            #       - 成功 episode 中最长执行时间
+            if wandb_enabled and wandb is not None:
+                wandb.log(eval_metrics, step=step)
+            if writer is not None:
+                for k, v in eval_metrics.items():
+                    writer.add_scalar(k, v, step)
+
+        # ---- checkpoint ----
         if step % cfg.train.checkpoint_every == 0:
             ckpt_path = os.path.join(run_dir, f"rainbow_step{step}.pt")
             agent.save(ckpt_path)
             print(f"[ckpt] saved to {ckpt_path}", flush=True)
 
     env.close()
+    if wandb_enabled and wandb is not None:
+        wandb.finish()
     if writer is not None:
         writer.close()
 
