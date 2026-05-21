@@ -90,15 +90,15 @@ class C51Config:
     """Categorical distributional Q (C51 / Bellemare et al. 2017).
 
     Plan A reward is non-negative:
-      single-chunk r ∈ [0.13, 1.51]
-      Episode return ≤ ~30 in practice (max_chunks_per_episode=100, but
-      successful episodes terminate well before that; γ=0.99).
-      [0, 20] gives 0.2-reward atom resolution at n_atoms=101 — fine
-      enough for a 3-D dueling C51 head, while leaving headroom for
-      longer episodes without the projector clipping mass.
+      single-chunk r ∈ [0.13, 1.51] (max only at terminal success step)
+      typical r_v per chunk ≈ 0.2~0.4
+      successful episode ~10-30 chunks, only the last gets r_task=1
+      realistic episode return ≈ 5~7 (with γ=0.99 discounting)
+      V_max=8 covers the practical upper bound with margin.
+      101 atoms → resolution 0.08/atom, very fine-grained.
     """
     v_min: float = 0.0
-    v_max: float = 20.0
+    v_max: float = 8.0
     n_atoms: int = 101
 
 

@@ -42,14 +42,20 @@ Factored Q heads → 共 **21 个 Q logits**（每个 logits 是 n_atoms=101 维
 | 参数 | 默认 | 备注 |
 |---|---|---|
 | V_min | 0.0 | 方案 A 下 reward ≥ 0 |
-| V_max | 20.0 | 实际 episode return 上界 ~15-20 |
-| n_atoms | 101 | 分辨率约 0.2 reward/atom |
+| V_max | 8.0 | 实际 episode return 上界 ~5-7 |
+| n_atoms | 101 | 分辨率约 0.08 reward/atom（很精细） |
 | n_step | 3 | Rainbow 标准 |
 
 **Reward 设计（方案 A，非负）**：
-- 正常 chunk: `r = r_v + r_task ∈ [0.13, 1.51]`
+- 正常 chunk: `r = r_v + r_task ∈ [0.13, 1.51]`，其中 r_v 单步 ~0.2-0.5
 - TOPP fallback: `r = 0`（不给负 penalty，靠 episode 预算消耗自然惩罚）
 - crash: `r = 0` 且 done=True（崩溃是工程异常，不参与 reward 信号）
+
+**Episode return 估算**：
+- 成功 episode 通常 10-30 chunk，只有末尾给 r_task=1
+- 平均每 chunk r_v ≈ 0.3，总 r_v ≈ 3-9，加 r_task=1
+- 实际折扣 return ≈ 5-7
+- V_max=8 留 ~15% 余量，避免 projector clip 极端值
 
 如果你的 reward 设置变了（比如改大 α），记得拓宽 V_max。
 
