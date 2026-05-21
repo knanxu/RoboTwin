@@ -24,11 +24,13 @@ class ActionSpaceConfig:
 @dataclass
 class RewardConfig:
     """
-    r_v = alpha_v * v^beta_v + alpha_vs * vel_scale^beta_vs + alpha_as * acc_scale^beta_as
-    r_task ∈ {0, 1}  若 chunk 执行后 check_success == True 则为 1, 否则 0
-    r_total = r_v + r_task
+    Plan A (non-negative reward):
+      r_v = alpha_v * v^beta_v + alpha_vs * vel_scale^beta_vs + alpha_as * acc_scale^beta_as
+      r_task ∈ {0, 1}  若 chunk 执行后 check_success == True 则为 1, 否则 0
+      r_total = r_v + r_task                    (正常 chunk)
+      r_total = 0                               (TOPP fallback / crash)
 
-    TOPP fallback 时 r_v 被屏蔽, 只给固定 -1 penalty.
+    Fallback / crash 不给负 penalty; episode 预算消耗本身就是隐性惩罚.
     """
     alpha_v: float = 0.05
     alpha_vs: float = 0.05
@@ -37,8 +39,8 @@ class RewardConfig:
     beta_vs: float = 2.0
     beta_as: float = 1.0
 
-    fallback_penalty: float = -1.0   # topp fallback 固定 penalty (屏蔽 r_v)
-    crash_penalty: float = -5.0      # 物理崩溃 / 推理失败 的 terminal penalty
+    fallback_penalty: float = 0.0    # 方案 A: 不给负 penalty
+    crash_penalty: float = 0.0       # 方案 A: 不给负 penalty (仅 terminal)
 
 
 @dataclass

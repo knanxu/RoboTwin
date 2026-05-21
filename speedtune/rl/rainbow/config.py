@@ -25,10 +25,19 @@ class ActionGridConfig:
 
 
 # ----------------------------------------------------------------------
-# Reward (matches the paper: r_ST = α · v^β + r_task, fallback shielded)
+# Reward (Plan A: non-negative reward only)
 # ----------------------------------------------------------------------
-# We keep the existing 3-component shape used by SAC for compatibility,
-# so the reward stays comparable across the two algorithms.
+# Per-chunk reward when TOPP solves and the chunk runs:
+#   r_v   = α_v · v^β_v + α_vs · vs^β_vs + α_as · as^β_as
+#   r_task = 1 if check_success() else 0
+#   r_total = r_v + r_task                              ∈ [0.13, 1.51]
+#
+# When TOPP fallback or env crash:
+#   r_total = 0   (no positive signal; episode budget keeps draining as
+#                  an implicit cost, so the agent still learns to avoid it)
+#   crash additionally terminates the episode.
+#
+# This keeps Q values ≥ 0 so C51 support can sit on [V_min=0, V_max=20].
 @dataclass
 class RewardConfig:
     alpha_v: float = 0.05
@@ -38,8 +47,8 @@ class RewardConfig:
     beta_vs: float = 2.0
     beta_as: float = 1.0
 
-    fallback_penalty: float = -1.0
-    crash_penalty: float = -5.0
+    fallback_penalty: float = 0.0    # 方案 A: 不再给负 penalty
+    crash_penalty: float = 0.0       # 方案 A: 不再给负 penalty (仅 terminal)
 
 
 # ----------------------------------------------------------------------
@@ -80,14 +89,16 @@ class NetworkConfig:
 class C51Config:
     """Categorical distributional Q (C51 / Bellemare et al. 2017).
 
-    V_min / V_max picked from this task's actual reward envelope:
-      single-chunk r_v ∈ [0.13, 0.51], r_task ∈ {0,1}, fallback = -1, crash = -5.
-      Episode-level return roughly in [-5, ~10] depending on length.
-      Picking [-5, 10] keeps the support wide enough to avoid clipping
-      and still gives ~0.15-reward resolution at 101 atoms.
+    Plan A reward is non-negative:
+      single-chunk r ∈ [0.13, 1.51]
+      Episode return ≤ ~30 in practice (max_chunks_per_episode=100, but
+      successful episodes terminate well before that; γ=0.99).
+      [0, 20] gives 0.2-reward atom resolution at n_atoms=101 — fine
+      enough for a 3-D dueling C51 head, while leaving headroom for
+      longer episodes without the projector clipping mass.
     """
-    v_min: float = -5.0
-    v_max: float = 10.0
+    v_min: float = 0.0
+    v_max: float = 20.0
     n_atoms: int = 101
 
 

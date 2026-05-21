@@ -41,13 +41,17 @@ Factored Q heads → 共 **21 个 Q logits**（每个 logits 是 n_atoms=101 维
 
 | 参数 | 默认 | 备注 |
 |---|---|---|
-| V_min | -5.0 | crash penalty 是 -5 |
-| V_max | 10.0 | episode 全成功 ~ Σ(0.5+1·末尾) ≤ 10 |
-| n_atoms | 101 | 分辨率约 0.15 reward/atom |
+| V_min | 0.0 | 方案 A 下 reward ≥ 0 |
+| V_max | 20.0 | 实际 episode return 上界 ~15-20 |
+| n_atoms | 101 | 分辨率约 0.2 reward/atom |
 | n_step | 3 | Rainbow 标准 |
 
-如果你的 reward 设置变了（比如改大 α），记得拓宽 V_min/V_max，否则
-target 投影会 clip 掉极端值。
+**Reward 设计（方案 A，非负）**：
+- 正常 chunk: `r = r_v + r_task ∈ [0.13, 1.51]`
+- TOPP fallback: `r = 0`（不给负 penalty，靠 episode 预算消耗自然惩罚）
+- crash: `r = 0` 且 done=True（崩溃是工程异常，不参与 reward 信号）
+
+如果你的 reward 设置变了（比如改大 α），记得拓宽 V_max。
 
 ## 启动训练
 
