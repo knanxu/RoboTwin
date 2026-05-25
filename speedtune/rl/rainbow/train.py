@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 from collections import deque
 from dataclasses import asdict
@@ -172,6 +173,15 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="speedtune-rainbow")
     parser.add_argument("--wandb_enabled", type=str, default="true",
                         help="Set to 'false' to disable wandb logging")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Existing wandb run id to resume into. Find it on the wandb "
+                             "run page URL (the last path segment) or in "
+                             "<run_dir>/wandb/latest-run/files/wandb-metadata.json.")
+    # Resume
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to a previous rainbow_stepN.pt checkpoint. "
+                             "Loads net/target/opt and continues from env step N "
+                             "(replay buffer is NOT saved, will refill).")
     args = parser.parse_args()
 
     cfg = FullConfig()
@@ -192,13 +202,21 @@ def main():
         wandb_enabled = False
 
     if wandb_enabled and wandb is not None:
-        wandb.init(
+        wandb_init_kwargs = dict(
             project=args.wandb_project,
             name=f"{cfg.train.run_name}_{cfg.env.task_name}",
             config=asdict(cfg),
             dir=run_dir,
         )
-        print(f"[wandb] logging to project '{args.wandb_project}'", flush=True)
+        if args.wandb_run_id is not None:
+            wandb_init_kwargs["id"] = args.wandb_run_id
+            wandb_init_kwargs["resume"] = "allow"
+        wandb.init(**wandb_init_kwargs)
+        if args.wandb_run_id is not None:
+            print(f"[wandb] resuming run id '{args.wandb_run_id}' "
+                  f"in project '{args.wandb_project}'", flush=True)
+        else:
+            print(f"[wandb] logging to project '{args.wandb_project}'", flush=True)
     else:
         if wandb is not None:
             wandb.init(mode="disabled")
@@ -242,6 +260,19 @@ def main():
         device=cfg.train.device,
     )
 
+    start_step = 0
+    if args.resume_from is not None:
+        print(f"[resume] loading checkpoint: {args.resume_from}", flush=True)
+        agent.load(args.resume_from)
+        m = re.search(r"step(\d+)", os.path.basename(args.resume_from))
+        if m:
+            start_step = int(m.group(1))
+        print(
+            f"[resume] continuing from env step {start_step}; "
+            f"replay buffer is empty and will refill before next update",
+            flush=True,
+        )
+
     obs, _ = env.reset(seed=cfg.train.seed)
     ep_return = 0.0
     ep_returns = deque(maxlen=20)
@@ -251,7 +282,7 @@ def main():
     start = time.time()
     rcfg = cfg.rainbow
     beta_steps = max(1, rcfg.per_beta_steps)
-    for step in range(1, cfg.train.total_env_steps + 1):
+    for step in range(start_step + 1, cfg.train.total_env_steps + 1):
         frac = min(1.0, step / beta_steps)
         beta = rcfg.per_beta_start + frac * (rcfg.per_beta_end - rcfg.per_beta_start)
 
