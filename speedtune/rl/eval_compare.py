@@ -82,7 +82,13 @@ def _to_sac_policy(cfg: RainbowFullConfig) -> _SACPolicyConfig:
 # Frame recorder: monkey-patch task_env.scene.step
 # -----------------------------------------------------------------------
 class FrameRecorder:
-    """每 sample_every 个 scene.step 抓一帧 head_camera RGB."""
+    """每 sample_every 个 scene.step 抓一帧 head_camera RGB.
+
+    顺便累计 ``total_record_time_s``: 每帧 _update_render + take_picture +
+    get_rgb 的耗时总和. 这部分时间是评估器人为加进去的, 不属于实机部署
+    的真实执行时间, eval runner 会从 wall_time_no_obs 里再扣一次, 得到
+    "真实部署执行时间".
+    """
 
     def __init__(self, sample_every: int = 10):
         self.sample_every = max(1, int(sample_every))
@@ -90,6 +96,7 @@ class FrameRecorder:
         self._counter = 0
         self._installed_env = None
         self._orig_step = None
+        self.total_record_time_s: float = 0.0
 
     def attach(self, task_env) -> None:
         if self._installed_env is not None:
@@ -104,6 +111,7 @@ class FrameRecorder:
             ret = orig_step(*args, **kwargs)
             recorder._counter += 1
             if recorder._counter % recorder.sample_every == 0:
+                _t0 = time.perf_counter()
                 try:
                     task_env._update_render()
                     cameras.update_picture()
@@ -114,6 +122,7 @@ class FrameRecorder:
                     recorder.frames.append(np.ascontiguousarray(rgb))
                 except Exception:
                     pass
+                recorder.total_record_time_s += time.perf_counter() - _t0
             return ret
 
         scene.step = patched_step
@@ -132,6 +141,7 @@ class FrameRecorder:
     def reset_buffer(self) -> None:
         self.frames = []
         self._counter = 0
+        self.total_record_time_s = 0.0
 
 
 # -----------------------------------------------------------------------
@@ -164,13 +174,19 @@ def _run_episode(
     if recorder is not None:
         recorder.detach()
 
+    record_overhead_s = float(recorder.total_record_time_s) if recorder is not None else 0.0
+    wall_no_obs = float(last_info.get("episode_wall_time_no_obs", 0.0))
+    deploy_time_s = max(0.0, wall_no_obs - record_overhead_s)
+
     return {
         "seed": int(seed),
         "success": bool(last_info.get("success", False)),
         "episode_return": float(ep_return),
         "n_chunks": int(n_chunks),
         "wall_time_s": float(last_info.get("episode_wall_time", 0.0)),
-        "wall_time_no_obs_s": float(last_info.get("episode_wall_time_no_obs", 0.0)),
+        "wall_time_no_obs_s": wall_no_obs,
+        "frame_record_overhead_s": record_overhead_s,
+        "deploy_time_s": deploy_time_s,
         "topp_total_s": float(last_info.get("episode_total_topp_time", 0.0)),
     }
 
@@ -275,13 +291,13 @@ def write_compare_video(
     summary_lines_left = [
         "Trained (Rainbow)",
         f"success: {trained_summary['success']}",
-        f"wall_time_no_obs: {trained_summary['wall_time_no_obs_s']:.2f}s",
+        f"deploy_time: {trained_summary['deploy_time_s']:.2f}s",
         f"chunks: {trained_summary['n_chunks']}",
     ]
     summary_lines_right = [
         "Baseline",
         f"success: {baseline_summary['success']}",
-        f"wall_time_no_obs: {baseline_summary['wall_time_no_obs_s']:.2f}s",
+        f"deploy_time: {baseline_summary['deploy_time_s']:.2f}s",
         f"chunks: {baseline_summary['n_chunks']}",
     ]
     summary_left = _make_summary_frame(W // 2, H, summary_lines_left)
@@ -411,7 +427,9 @@ def main():
             trained_frames_first = list(rec.frames)
         print(f"  [trained ep{i} seed={seed}] "
               f"success={info['success']} "
-              f"wall_no_obs={info['wall_time_no_obs_s']:.2f}s "
+              f"deploy={info['deploy_time_s']:.2f}s "
+              f"(wall_no_obs={info['wall_time_no_obs_s']:.2f}s, "
+              f"record_overhead={info['frame_record_overhead_s']:.2f}s) "
               f"chunks={info['n_chunks']}", flush=True)
 
     # ----- baseline side -----
@@ -424,7 +442,9 @@ def main():
             baseline_frames_first = list(rec.frames)
         print(f"  [baseline ep{i} seed={seed}] "
               f"success={info['success']} "
-              f"wall_no_obs={info['wall_time_no_obs_s']:.2f}s "
+              f"deploy={info['deploy_time_s']:.2f}s "
+              f"(wall_no_obs={info['wall_time_no_obs_s']:.2f}s, "
+              f"record_overhead={info['frame_record_overhead_s']:.2f}s) "
               f"chunks={info['n_chunks']}", flush=True)
 
     env.close()
@@ -440,11 +460,18 @@ def main():
     # ----- aggregate metrics -----
     def _agg(rs: List[dict]) -> dict:
         succs = [r["success"] for r in rs]
+        succ_deploy = [r["deploy_time_s"] for r in rs if r["success"]]
         succ_walls = [r["wall_time_no_obs_s"] for r in rs if r["success"]]
         return {
             "n_episodes": len(rs),
             "success_rate": float(np.mean(succs)) if succs else 0.0,
             "n_success": int(sum(succs)),
+            "deploy_time_s_mean_success_only":
+                float(np.mean(succ_deploy)) if succ_deploy else None,
+            "deploy_time_s_min_success_only":
+                float(np.min(succ_deploy)) if succ_deploy else None,
+            "deploy_time_s_max_success_only":
+                float(np.max(succ_deploy)) if succ_deploy else None,
             "wall_time_no_obs_s_mean_success_only":
                 float(np.mean(succ_walls)) if succ_walls else None,
             "wall_time_no_obs_s_min_success_only":
@@ -478,11 +505,15 @@ def main():
     t_agg = summary["trained"]["aggregate"]
     b_agg = summary["baseline"]["aggregate"]
     print("\n========== RESULTS ==========")
+    print("  (deploy_time_s = wall_time_no_obs - frame_record_overhead,")
+    print("   i.e. estimated real-deployment execution time)")
     print(f"  trained:  sr={t_agg['success_rate']:.2f} "
           f"({t_agg['n_success']}/{t_agg['n_episodes']})  "
+          f"deploy_mean={t_agg['deploy_time_s_mean_success_only']}  "
           f"wall_no_obs_mean={t_agg['wall_time_no_obs_s_mean_success_only']}")
     print(f"  baseline: sr={b_agg['success_rate']:.2f} "
           f"({b_agg['n_success']}/{b_agg['n_episodes']})  "
+          f"deploy_mean={b_agg['deploy_time_s_mean_success_only']}  "
           f"wall_no_obs_mean={b_agg['wall_time_no_obs_s_mean_success_only']}")
     print(f"  video:    {video_path}")
     print("=============================\n")
