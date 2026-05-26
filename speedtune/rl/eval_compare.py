@@ -105,6 +105,8 @@ class FrameRecorder:
             recorder._counter += 1
             if recorder._counter % recorder.sample_every == 0:
                 try:
+                    task_env._update_render()
+                    cameras.update_picture()
                     rgb_dict = cameras.get_rgb()
                     rgb = rgb_dict["head_camera"]["rgb"]
                     if rgb.dtype != np.uint8:
