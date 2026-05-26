@@ -102,6 +102,9 @@ class ChunkSpeedupEnv:
         self._episode_obs_time = 0.0         # 累计 success 分支里 get_obs() 的耗时
         self._episode_wall_time = 0.0        # 当前累计 wall time
         self._episode_wall_time_no_obs = 0.0 # wall_time - obs_time
+        # 拆分: pi0.5 推理 vs chunk 执行 (deploy time = 这两者之和)
+        self._episode_pi_infer_time = 0.0    # 累计 _infer_pi 耗时 (含 reset 首发)
+        self._episode_chunk_exec_time = 0.0  # 累计 take_chunk_action 耗时
 
         # pi0.5 远端 client (lazy 创建, 因为云端 server 可能晚启动)
         from openpi_client import websocket_client_policy as _ws  # noqa: E402
@@ -195,9 +198,11 @@ class ChunkSpeedupEnv:
         }
 
     def _infer_pi(self) -> Tuple[np.ndarray, np.ndarray]:
-        """返回 (chunk[T, action_dim], cond_emb[D])."""
+        """返回 (chunk[T, action_dim], cond_emb[D]). 累计 pi0.5 推理墙钟到 episode 计时器."""
         obs = self._build_pi_obs()
+        _t0 = time.perf_counter()
         out = self._policy_client.infer_with_hidden(obs)
+        self._episode_pi_infer_time += time.perf_counter() - _t0
         actions = np.asarray(out["actions"])[: self.policy_cfg.pi0_step]
         cond = np.asarray(out["cond_emb"], dtype=np.float32)
         if cond.shape[0] != self.env_cfg.cond_emb_dim:
@@ -274,6 +279,8 @@ class ChunkSpeedupEnv:
         self._instruction = instruction
 
         # 推第一段 chunk + cond_emb
+        self._episode_pi_infer_time = 0.0
+        self._episode_chunk_exec_time = 0.0
         chunk, cond = self._infer_pi()
         self._latest_chunk = chunk
         self._latest_cond_emb = cond
@@ -304,9 +311,11 @@ class ChunkSpeedupEnv:
             self._episode_wall_t0 = time.perf_counter()
 
         try:
+            _t_exec = time.perf_counter()
             chunk_info = self._task_env.take_chunk_action(
                 chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
             )
+            self._episode_chunk_exec_time += time.perf_counter() - _t_exec
         except Exception as e:
             info["error"] = repr(e)
             self._finalize_wall_time()
@@ -354,6 +363,8 @@ class ChunkSpeedupEnv:
             info["episode_obs_time"] = self._episode_obs_time
             info["episode_wall_time_no_obs"] = self._episode_wall_time_no_obs
             info["episode_total_topp_time"] = self._episode_total_time
+            info["episode_pi_infer_time"] = self._episode_pi_infer_time
+            info["episode_chunk_exec_time"] = self._episode_chunk_exec_time
             return self._assemble_state(self._latest_cond_emb), reward, terminated, truncated, info
 
         # ---- 推下一段 ----
