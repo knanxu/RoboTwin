@@ -105,6 +105,9 @@ class ChunkSpeedupEnv:
         # 拆分: pi0.5 推理 vs chunk 执行 (deploy time = 这两者之和)
         self._episode_pi_infer_time = 0.0    # 累计 _infer_pi 耗时 (含 reset 首发)
         self._episode_chunk_exec_time = 0.0  # 累计 take_chunk_action 耗时
+        # 真实机器人执行时间 (按 dense_steps / 250Hz 累加, 不受仿真器快慢影响)
+        self._episode_real_exec_time = 0.0
+        self._sim_hz = 250.0
 
         # pi0.5 远端 client (lazy 创建, 因为云端 server 可能晚启动)
         from openpi_client import websocket_client_policy as _ws  # noqa: E402
@@ -281,6 +284,7 @@ class ChunkSpeedupEnv:
         # 推第一段 chunk + cond_emb
         self._episode_pi_infer_time = 0.0
         self._episode_chunk_exec_time = 0.0
+        self._episode_real_exec_time = 0.0
         chunk, cond = self._infer_pi()
         self._latest_chunk = chunk
         self._latest_cond_emb = cond
@@ -330,6 +334,8 @@ class ChunkSpeedupEnv:
         info["chunk_info"] = chunk_info
         self._episode_step_count += 1
         self._episode_total_time += float(chunk_info.get("duration", 0.0))
+        # 真实硬件执行时间: dense_steps 是这一 chunk 实际下发的 250Hz 物理步数
+        self._episode_real_exec_time += float(chunk_info.get("dense_steps", 0)) / self._sim_hz
         # 累计本 chunk 内 success 分支的 get_obs 耗时 (从 take_chunk_action info 取)
         self._episode_obs_time += float(chunk_info.get("success_obs_time", 0.0))
 
@@ -365,6 +371,7 @@ class ChunkSpeedupEnv:
             info["episode_total_topp_time"] = self._episode_total_time
             info["episode_pi_infer_time"] = self._episode_pi_infer_time
             info["episode_chunk_exec_time"] = self._episode_chunk_exec_time
+            info["episode_real_exec_time"] = self._episode_real_exec_time
             return self._assemble_state(self._latest_cond_emb), reward, terminated, truncated, info
 
         # ---- 推下一段 ----

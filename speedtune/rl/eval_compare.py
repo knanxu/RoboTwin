@@ -177,11 +177,10 @@ def _run_episode(
     record_overhead_s = float(recorder.total_record_time_s) if recorder is not None else 0.0
     wall_no_obs = float(last_info.get("episode_wall_time_no_obs", 0.0))
     pi_infer_s = float(last_info.get("episode_pi_infer_time", 0.0))
-    chunk_exec_raw_s = float(last_info.get("episode_chunk_exec_time", 0.0))
-    obs_time_s = float(last_info.get("episode_obs_time", 0.0))
-    # 实际动作执行时间 = take_chunk_action 总墙钟 - 成功帧 get_obs - 评估器额外渲染
-    chunk_exec_s = max(0.0, chunk_exec_raw_s - obs_time_s - record_overhead_s)
-    deploy_time_s = pi_infer_s + chunk_exec_s
+    # 真实硬件执行时间 = dense_steps / 250Hz, 累加每个 chunk.
+    # 不受仿真器快慢 / 评估器额外渲染影响, 是实机部署上动作真正消耗的时间.
+    real_exec_s = float(last_info.get("episode_real_exec_time", 0.0))
+    deploy_time_s = pi_infer_s + real_exec_s
 
     return {
         "seed": int(seed),
@@ -192,7 +191,7 @@ def _run_episode(
         "wall_time_no_obs_s": wall_no_obs,
         "frame_record_overhead_s": record_overhead_s,
         "pi_infer_time_s": pi_infer_s,
-        "chunk_exec_time_s": chunk_exec_s,
+        "real_exec_time_s": real_exec_s,
         "deploy_time_s": deploy_time_s,
         "topp_total_s": float(last_info.get("episode_total_topp_time", 0.0)),
     }
@@ -300,7 +299,7 @@ def write_compare_video(
         f"success: {trained_summary['success']}",
         f"deploy_time: {trained_summary['deploy_time_s']:.2f}s",
         f"  pi_infer:  {trained_summary['pi_infer_time_s']:.2f}s",
-        f"  chunk_exec:{trained_summary['chunk_exec_time_s']:.2f}s",
+        f"  real_exec: {trained_summary['real_exec_time_s']:.2f}s",
         f"chunks: {trained_summary['n_chunks']}",
     ]
     summary_lines_right = [
@@ -308,7 +307,7 @@ def write_compare_video(
         f"success: {baseline_summary['success']}",
         f"deploy_time: {baseline_summary['deploy_time_s']:.2f}s",
         f"  pi_infer:  {baseline_summary['pi_infer_time_s']:.2f}s",
-        f"  chunk_exec:{baseline_summary['chunk_exec_time_s']:.2f}s",
+        f"  real_exec: {baseline_summary['real_exec_time_s']:.2f}s",
         f"chunks: {baseline_summary['n_chunks']}",
     ]
     summary_left = _make_summary_frame(W // 2, H, summary_lines_left)
@@ -440,7 +439,7 @@ def main():
               f"success={info['success']} "
               f"deploy={info['deploy_time_s']:.2f}s "
               f"(pi_infer={info['pi_infer_time_s']:.2f}s "
-              f"+ chunk_exec={info['chunk_exec_time_s']:.2f}s) "
+              f"+ real_exec={info['real_exec_time_s']:.2f}s) "
               f"chunks={info['n_chunks']}", flush=True)
 
     # ----- baseline side -----
@@ -455,7 +454,7 @@ def main():
               f"success={info['success']} "
               f"deploy={info['deploy_time_s']:.2f}s "
               f"(pi_infer={info['pi_infer_time_s']:.2f}s "
-              f"+ chunk_exec={info['chunk_exec_time_s']:.2f}s) "
+              f"+ real_exec={info['real_exec_time_s']:.2f}s) "
               f"chunks={info['n_chunks']}", flush=True)
 
     env.close()
@@ -473,7 +472,7 @@ def main():
         succs = [r["success"] for r in rs]
         succ_deploy = [r["deploy_time_s"] for r in rs if r["success"]]
         succ_pi = [r["pi_infer_time_s"] for r in rs if r["success"]]
-        succ_exec = [r["chunk_exec_time_s"] for r in rs if r["success"]]
+        succ_exec = [r["real_exec_time_s"] for r in rs if r["success"]]
         succ_walls = [r["wall_time_no_obs_s"] for r in rs if r["success"]]
         return {
             "n_episodes": len(rs),
@@ -487,7 +486,7 @@ def main():
                 float(np.max(succ_deploy)) if succ_deploy else None,
             "pi_infer_time_s_mean_success_only":
                 float(np.mean(succ_pi)) if succ_pi else None,
-            "chunk_exec_time_s_mean_success_only":
+            "real_exec_time_s_mean_success_only":
                 float(np.mean(succ_exec)) if succ_exec else None,
             "wall_time_no_obs_s_mean_success_only":
                 float(np.mean(succ_walls)) if succ_walls else None,
@@ -522,20 +521,20 @@ def main():
     t_agg = summary["trained"]["aggregate"]
     b_agg = summary["baseline"]["aggregate"]
     print("\n========== RESULTS ==========")
-    print("  deploy_time_s = pi_infer_time_s + chunk_exec_time_s")
-    print("  pi_infer_time_s : sum of all _infer_pi() wall times this episode")
-    print("  chunk_exec_time_s: sum of take_chunk_action() wall times,")
-    print("                     minus success-frame get_obs and frame-recorder overhead")
+    print("  deploy_time_s = pi_infer_time_s + real_exec_time_s")
+    print("  pi_infer_time_s : sum of all _infer_pi() wall times (websocket round-trip)")
+    print("  real_exec_time_s: sum of dense_steps / 250Hz across all chunks")
+    print("                    (true robot-hardware execution time, not sim wall time)")
     print(f"  trained:  sr={t_agg['success_rate']:.2f} "
           f"({t_agg['n_success']}/{t_agg['n_episodes']})  "
           f"deploy={t_agg['deploy_time_s_mean_success_only']}s "
           f"(pi_infer={t_agg['pi_infer_time_s_mean_success_only']}s + "
-          f"chunk_exec={t_agg['chunk_exec_time_s_mean_success_only']}s)")
+          f"real_exec={t_agg['real_exec_time_s_mean_success_only']}s)")
     print(f"  baseline: sr={b_agg['success_rate']:.2f} "
           f"({b_agg['n_success']}/{b_agg['n_episodes']})  "
           f"deploy={b_agg['deploy_time_s_mean_success_only']}s "
           f"(pi_infer={b_agg['pi_infer_time_s_mean_success_only']}s + "
-          f"chunk_exec={b_agg['chunk_exec_time_s_mean_success_only']}s)")
+          f"real_exec={b_agg['real_exec_time_s_mean_success_only']}s)")
     print(f"  video:    {video_path}")
     print("=============================\n")
 
