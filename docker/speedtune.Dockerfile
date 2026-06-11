@@ -26,22 +26,6 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility
 ENV PYOPENGL_PLATFORM=egl
 
 # ------------------------------------------------------------------
-# Mirror knobs (build args). 默认走清华源, 国外环境传:
-#   --build-arg MINIFORGE_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
-#   --build-arg PIP_INDEX_URL=https://pypi.org/simple
-#   --build-arg PYTORCH3D_GIT=https://github.com/facebookresearch/pytorch3d.git
-#   --build-arg CUROBO_GIT=https://github.com/NVlabs/curobo.git
-# ------------------------------------------------------------------
-ARG MINIFORGE_URL=https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/LatestRelease/Miniforge3-Linux-x86_64.sh
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
-ARG PYTORCH3D_GIT=https://github.com/facebookresearch/pytorch3d.git
-ARG CUROBO_GIT=https://github.com/NVlabs/curobo.git
-ENV PIP_INDEX_URL=$PIP_INDEX_URL
-ENV PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST
-ENV UV_INDEX_URL=$PIP_INDEX_URL
-
-# ------------------------------------------------------------------
 # 1. system deps (GL / ffmpeg / git / build tools)
 # ------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,26 +37,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg linux-headers-generic \
         && rm -rf /var/lib/apt/lists/*
 
-# Make git fetches retry on flaky links instead of dying mid-stream.
-RUN git config --system http.lowSpeedLimit 1000 && \
-    git config --system http.lowSpeedTime 60 && \
-    git config --system http.postBuffer 1048576000
-
 # ------------------------------------------------------------------
 # 2. miniforge (conda) + uv
 # ------------------------------------------------------------------
-RUN curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
-        "$MINIFORGE_URL" -o /tmp/miniforge.sh && \
+RUN curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" \
+        -o /tmp/miniforge.sh && \
     bash /tmp/miniforge.sh -b -p $CONDA_DIR && \
     rm /tmp/miniforge.sh && \
     conda config --set always_yes yes --set changeps1 no
-
-# 让 conda 的 conda-forge / defaults 走清华源 (PIP_INDEX_URL 用国内时同步切)
-RUN if echo "$PIP_INDEX_URL" | grep -q "tuna.tsinghua"; then \
-        conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main && \
-        conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge && \
-        conda config --set show_channel_urls yes ; \
-    fi
 
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /usr/local/bin/
 
@@ -93,11 +65,7 @@ COPY openpi/uv.lock ./uv.lock
 COPY openpi/packages/openpi-client/pyproject.toml ./packages/openpi-client/pyproject.toml
 COPY openpi/packages/openpi-client/src ./packages/openpi-client/src
 
-RUN GIT_LFS_SKIP_SMUDGE=1 \
-    bash -c 'for i in 1 2 3 4 5; do \
-        uv sync --frozen --no-install-project --no-dev && exit 0; \
-        echo "[uv sync] attempt $i failed, retrying in 10s..."; sleep 10; \
-    done; exit 1'
+RUN GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
 
 # transformers_replace: openpi 对 transformers 源码的 in-place patch
 COPY openpi/src/openpi/models_pytorch/transformers_replace /tmp/openpi_tr_replace
@@ -105,9 +73,6 @@ RUN $OPENPI_VENV/bin/python -c \
         "import transformers, os; print(os.path.dirname(transformers.__file__))" \
         | xargs -I{} cp -r /tmp/openpi_tr_replace/. {}/ && \
     rm -rf /tmp/openpi_tr_replace /tmp/openpi_build
-
-# Extras for tools/convert_robotwin_to_lerobot.py (reads RoboTwin hdf5)
-RUN $OPENPI_VENV/bin/pip install --no-cache-dir h5py tqdm
 
 # ------------------------------------------------------------------
 # 4. RoboTwin conda env (Python 3.10)
@@ -121,7 +86,7 @@ RUN $ROBOTWIN_VENV/bin/pip install --no-cache-dir -r /tmp/robotwin_requirements.
 
 # pytorch3d (stable, no build isolation)
 RUN $ROBOTWIN_VENV/bin/pip install --no-cache-dir \
-        "git+${PYTORCH3D_GIT}@stable" --no-build-isolation
+        "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
 
 # RL 通信依赖
 RUN $ROBOTWIN_VENV/bin/pip install --no-cache-dir \
@@ -134,7 +99,7 @@ RUN PLAN="$($ROBOTWIN_VENV/bin/python -c 'import mplib, os; print(os.path.join(o
     sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' "$PLAN"
 
 # curobo 装在 /opt 下, 不进入 /app (防止被挂载覆盖). 运行时通过 symlink 暴露到 envs/curobo
-RUN git clone --branch v0.7.8 --depth 1 "$CUROBO_GIT" /opt/curobo && \
+RUN git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git /opt/curobo && \
     cd /opt/curobo && \
     $ROBOTWIN_VENV/bin/pip install --no-cache-dir -e . --no-build-isolation
 

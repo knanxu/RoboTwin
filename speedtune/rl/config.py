@@ -1,13 +1,14 @@
-"""
-SAC for chunk-speedup 训练配置.
+"""Chunk-speedup 训练的共享配置 (动作空间 / 奖励 / env / pi0.5 server).
 
-所有超参集中在这里, 方便手调. 默认值按用户指定:
-  - action 空间: 保守边界
-  - reward 系数: alpha=0.05 均匀, beta=[2, 2, 1]
-  - topp fallback: 固定 -1 penalty, 屏蔽 r_v
+这些 dataclass 被 ChunkSpeedupEnv (rl/env.py) 直接消费. Rainbow 训练
+(rl/rainbow/) 通过 adapter 把自己的 FullConfig 转成这里的形状再喂给 env;
+算法专属超参 (C51 / Rainbow / 网络 / 训练循环) 见 rl/rainbow/config.py.
+
+默认值:
+  - action 空间: 保守边界 (smoke_replay_expert 验证过的安全区)
+  - reward: Plan A 非负奖励 (fallback / crash 给 0, 不给负 penalty)
 """
-from dataclasses import dataclass, field
-from typing import List, Tuple
+from dataclasses import dataclass
 
 
 @dataclass
@@ -67,51 +68,3 @@ class PolicyConfig:
     api_key: str | None = None
     # 每次从返回的 action chunk 中截取的前 pi0_step 帧 (对齐 pi_model.py:47)
     pi0_step: int = 50
-
-
-@dataclass
-class NetworkConfig:
-    hidden_sizes: Tuple[int, ...] = (512, 512, 256)
-    log_std_min: float = -5.0
-    log_std_max: float = 2.0
-
-
-@dataclass
-class SACConfig:
-    gamma: float = 0.99
-    tau: float = 0.005              # target network soft update
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
-    alpha_lr: float = 3e-4
-    init_temperature: float = 0.2
-    target_entropy: float = -3.0    # -action_dim
-    batch_size: int = 256
-    buffer_size: int = 100_000
-    warmup_steps: int = 1000        # 纯随机 action 的 step 数
-    updates_per_step: int = 1
-
-
-@dataclass
-class TrainConfig:
-    total_env_steps: int = 50_000
-    eval_every: int = 2000
-    eval_episodes: int = 10
-    checkpoint_every: int = 5000
-    log_every: int = 50
-
-    seed: int = 42
-    device: str = "cuda"
-
-    run_name: str = "sac_chunk_speedup"
-    log_dir: str = "./speedtune/rl/runs"
-
-
-@dataclass
-class FullConfig:
-    action_space: ActionSpaceConfig = field(default_factory=ActionSpaceConfig)
-    reward: RewardConfig = field(default_factory=RewardConfig)
-    env: EnvConfig = field(default_factory=EnvConfig)
-    policy: PolicyConfig = field(default_factory=PolicyConfig)
-    network: NetworkConfig = field(default_factory=NetworkConfig)
-    sac: SACConfig = field(default_factory=SACConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)

@@ -1,19 +1,21 @@
-# Chunk-Speedup RL (SAC)
+# Chunk-Speedup RL (Rainbow DQN)
 
-用 SAC 训一个 agent, 看当前 pi0.5 推理出的 chunk 条件下, 选什么
-`(v, vel_scale, acc_scale)` 三元组能最快把任务做完而不掉成功率.
+用 Rainbow DQN (C51 + dueling + PER + n-step + noisy) 训一个 agent, 看当前
+pi0.5 推理出的 chunk 条件下, 选什么 `(v, vel_scale, acc_scale)` 三元组能最快把
+任务做完而不掉成功率. (此前的 SAC 连续控制版本已废弃删除, 算法专属超参见
+`rl/rainbow/config.py`, 共享的 env/奖励/动作空间配置见 `rl/config.py`.)
 
-- 动作: `(v, vel_scale, acc_scale)` 绝对值, tanh → linear map 到保守边界
-  `v∈[0.8,1.5]`, `vel∈[1.0,2.0]`, `acc∈[1.0,4.0]` (可在 `config.py` 改)
+- 动作: `(v, vel_scale, acc_scale)` 离散网格 (Rainbow 用离散动作), 边界
+  `v∈[0.8,1.5]`, `vel∈[1.0,2.0]`, `acc∈[1.0,4.0]` (可在 `rl/rainbow/config.py` 改)
 - 状态: pi0.5 action expert 的 mean-pooled prefix features (2048D) +
   上一步动作 (3D) + cnt 进度 (1D) + 上一步是否 topp fallback (1D) = 2053D
-- Reward:
+- Reward (Plan A 非负奖励):
   ```
   r_v = α_v * v^β_v + α_vs * vel_scale^β_vs + α_as * acc_scale^β_as
   r_task = 1 if chunk 执行后 check_success else 0
   r = r_v + r_task
   ```
-  TOPP fallback 时 `r_v` 屏蔽, 给固定 `-1` penalty.
+  TOPP fallback / crash 时屏蔽 `r_v`, 给 `0` penalty (预算消耗本身即隐性惩罚).
 
 
 ## 部署拓扑
@@ -22,117 +24,102 @@
 
 ```
 云端 GPU 主机
-└─ docker compose, 一个 image 起多个一次性/常驻容器:
-     ├─ collect         采 RoboTwin 专家数据 (Sapien, headless, conda RoboTwin)
-     ├─ convert         RoboTwin hdf5 → LeRobot v2.0  (openpi venv)
-     ├─ sft             pi0.5 drift SFT (openpi venv, compute_norm_stats + train_pytorch)
-     ├─ openpi_server   起 WebSocket 推理服务 (openpi venv)  [常驻]
-     └─ robotwin_train  SAC 训练 agent (conda RoboTwin)     [常驻]
+└─ docker compose (docker/compose.yml), 一个 image 起两个容器:
+     ├─ openpi_server   [venv: /opt/venvs/openpi, py3.11]
+     │    serve_policy.py, 监听 0.0.0.0:8000
+     └─ robotwin_train  [venv: conda RoboTwin, py3.10]
+          speedtune/rl/rainbow/train.py
+            └─ WebsocketClient(127.0.0.1:8000)  ← 宿主回环, 无额外延迟
+            └─ RoboTwin Sapien sim (headless, EGL)
+            └─ Rainbow DQN on cuda
 
 本机 (开发/监控)
-└─ ssh 进去看 docker logs / 端口转发 tensorboard
+└─ ssh 进去看 tmux 日志 / 端口转发 tensorboard
 ```
 
-同一个 image (`speedtune:latest`) 里同时装了:
-- uv venv `/opt/venvs/openpi` (py3.11, flax/jax/torch/lerobot)
-- conda env `RoboTwin` (py3.10, sapien/mplib/curobo/pytorch3d/websockets)
+两个容器共享同一个 image (`speedtune:latest`) —— image 里同时装了:
+- `/opt/venvs/openpi` (uv 管理, py3.11, flax/jax/torch)
+- `conda env RoboTwin` (py3.10, sapien/mplib/curobo/pytorch3d + websockets)
 
-所有 service 共用这个 image, 各自激活各自的 venv.
+各自激活各自的 venv 跑不同入口, 互不干扰.
+本机不跑推理, pi0.5 权重也不用下到本机. 云端 GPU ≥ 24GB.
 
 
-## 一把梭 (从零到 ckpt 到 RL 训练)
+## Step 1: fork 仓库
 
-**服务器上只需要装好 docker + nvidia-container-toolkit**, 其余全在容器里.
+- fork **RoboTwin** (本仓库)
+- fork **openpi** 的带 drift model 和 `infer_with_hidden` 的分支
+
+两个 fork push 上去.
+
+
+## Step 2: 云端拉代码 + 放 checkpoint
 
 ```bash
-# 0) 克隆两个仓库 side-by-side
+# 要求两个仓库 side-by-side
 mkdir -p ~/work && cd ~/work
 git clone <your-openpi-fork>.git openpi
 git -C openpi checkout <your-drifting-branch>
 git clone <your-RoboTwin-fork>.git RoboTwin
 
-# 1) (可选) 如果你已经有 pi0.5 ckpt, 放到:
-#      ~/.cache/openpi/checkpoints/<policy_config>/<exp>/<step>/
-#    然后直接跑 runtime stage, 跳过 collect/convert/sft.
-#
-#    如果从零开始, 直接:
-cd ~/work/RoboTwin
-bash docker/run_pipeline.sh all
+# 放 checkpoint (默认挂到容器里的 /openpi_assets)
+mkdir -p ~/.cache/openpi/checkpoints
+# 把 ckpt 同步过来, 例如:
+#   ~/.cache/openpi/checkpoints/pi05_aloha_robotwin_drifting_shake_bottle/default/29999
 ```
 
-`bash docker/run_pipeline.sh all` 会依次执行:
-1. `collect`  采 100 集 `shake_bottle` 专家 demo (几十分钟到几小时)
-2. `convert`  转成 LeRobot 格式到 `~/.cache/huggingface/lerobot/shake_bottle_drifting_repo`
-3. `sft`      在一张 GPU 上训 30k 步 pi0.5 drift (约 12-24 小时)
-4. `link`     把 ckpt 软链到 server 挂载点
-5. `runtime`  并发起 openpi_server + robotwin_train
 
-每一步也可以单独跑, 见下面 "分阶段调试".
-
-
-## 分阶段调试
+## Step 3: 一把起 server + 训练
 
 ```bash
 cd ~/work/RoboTwin
 
-# 采集: 默认 task=shake_bottle, config=demo_clean
-bash docker/run_pipeline.sh collect shake_bottle demo_clean
+# 选任务对应的 ckpt config
+export POLICY_CONFIG=pi05_aloha_robotwin_drifting_shake_bottle
+export POLICY_DIR=/openpi_assets/checkpoints/$POLICY_CONFIG/default/29999
 
-# 数据转换 (hdf5 → LeRobot)
-bash docker/run_pipeline.sh convert shake_bottle demo_clean shake_bottle_drifting_repo
+# 默认 server 和训练都拿 GPU 0; 两张卡就分开:
+# export OPENPI_GPU=0 ROBOTWIN_GPU=1
 
-# SFT (单卡)
-bash docker/run_pipeline.sh sft pi05_aloha_robotwin_drifting_shake_bottle default
+docker compose -f docker/compose.yml up --build
+```
 
-# SFT (多卡, 2 张)
-NPROC_PER_NODE=2 SFT_GPU=0,1 \
-    bash docker/run_pipeline.sh sft pi05_aloha_robotwin_drifting_shake_bottle default
+第一次 build 会装 flax/jax/torch/sapien/pytorch3d/curobo 等, 估计 20-40 分钟.
+后续启动 <1 分钟. server 会先起, `robotwin_train` 会轮询 `127.0.0.1:8000`
+通了才启动训练.
 
-# ckpt 软链 (把 openpi/checkpoints/<pol>/<exp>/<step> 链到 ~/.cache/openpi/checkpoints/)
-bash docker/run_pipeline.sh link pi05_aloha_robotwin_drifting_shake_bottle default 29999
 
-# 只起 server (前台, 方便看日志)
-bash docker/run_pipeline.sh serve pi05_aloha_robotwin_drifting_shake_bottle default 29999
+## Step 4: 调试 / 只起 server
 
-# 只起 RL 训练 (前提: server 已经起了)
-bash docker/run_pipeline.sh rl shake_bottle smoke_test
+只起 server, 手动进训练容器跑:
 
-# server + RL 一起起
-bash docker/run_pipeline.sh runtime pi05_aloha_robotwin_drifting_shake_bottle default 29999
+```bash
+docker compose -f docker/compose.yml up --build openpi_server
+# 另开一个 shell
+docker compose -f docker/compose.yml run --rm robotwin_train bash
+# 容器里:
+conda activate RoboTwin
+python -m speedtune.rl.rainbow.train --task_name shake_bottle --task_config smoke_test
+```
+
+容器里也可以直接走 openpi venv 跑别的 openpi 脚本:
+
+```bash
+docker compose -f docker/compose.yml run --rm openpi_server bash
+# 容器里:
+/opt/venvs/openpi/bin/python -c "import openpi, flax, jax; print('ok')"
 ```
 
 
-## 常用环境变量
-
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `TASK_NAME`         | `shake_bottle` | RoboTwin 任务名 |
-| `TASK_CONFIG`       | `demo_clean` | collect/convert 阶段的 task_config |
-| `RL_TASK_CONFIG`    | `smoke_test` | RL 训练/eval 阶段的 task_config |
-| `REPO_ID`           | `shake_bottle_drifting_repo` | LeRobot dataset repo_id, 必须和 openpi config 匹配 |
-| `EPISODE_NUM`       | `-1`  | convert 时取前 N 集, -1 = 全部 |
-| `POLICY_CONFIG`     | `pi05_aloha_robotwin_drifting_shake_bottle` | openpi train config 名 |
-| `EXP_NAME`          | `default` | SFT 实验名 (写到 ckpt 目录) |
-| `SFT_STEP`          | `29999` | serve/link 用哪一个 ckpt step |
-| `NPROC_PER_NODE`    | `1` | SFT 用几张 GPU (torchrun --nproc_per_node) |
-| `OPENPI_GPU`        | `0` | server 容器用哪张 GPU |
-| `ROBOTWIN_GPU`      | `0` | RL 训练容器用哪张 GPU |
-| `SFT_GPU`           | `0` | SFT 容器用哪张 GPU (多卡: `0,1`) |
-| `COLLECT_GPU`       | `0` | collect 容器用哪张 GPU |
-| `OPENPI_DATA_HOME`  | `~/.cache/openpi` | 宿主放 ckpt/norm stats 的目录, 挂到 `/openpi_assets` |
-| `LEROBOT_HOME`      | `~/.cache/huggingface/lerobot` | 宿主放 LeRobot dataset 的目录 |
-| `TOTAL_ENV_STEPS`   | `50000` | RL 训练总步数 |
-| `WARMUP_STEPS`      | `1000`  | RL 随机 warmup 步数 |
-
-
-## 本机看日志 / TensorBoard (可选)
+## Step 5: 本机看日志 (可选)
 
 ```bash
-# 看某个 service 日志
+# 5a. 直接 ssh 进去看 docker 日志
 ssh <user>@<云端IP> 'cd work/RoboTwin && docker compose -f docker/compose.yml logs -f robotwin_train'
 
-# TensorBoard 端口转发 (在容器外宿主起, 直接读挂载的 runs/)
+# 5b. 把云端 tensorboard 端口转发回本机
 ssh -N -f -L 6006:127.0.0.1:6006 <user>@<云端IP>
+# 云端起 tensorboard (容器外, 直接读挂载的 runs/):
 ssh <user>@<云端IP> 'cd work/RoboTwin && tensorboard --logdir speedtune/rl/runs --port 6006'
 # 本机浏览器打开 http://127.0.0.1:6006
 ```
@@ -144,12 +131,10 @@ ssh <user>@<云端IP> 'cd work/RoboTwin && tensorboard --logdir speedtune/rl/run
 (默认 `server_host=127.0.0.1`):
 
 ```bash
-# 云端
-bash docker/run_pipeline.sh serve pi05_aloha_robotwin_drifting_shake_bottle default 29999
-
-# 本机
+# 云端把 server 跑起来 (用上面 Step 3 的 compose 也行)
+# 本机:
 ssh -N -f -L 8000:localhost:8000 <user>@<云端IP>
-python -m speedtune.rl.train   # 本机 Sapien + 云端 pi0.5
+python -m speedtune.rl.rainbow.train   # 本机 Sapien + 云端 pi0.5
 ```
 
 
@@ -157,10 +142,10 @@ python -m speedtune.rl.train   # 本机 Sapien + 云端 pi0.5
 
 ```bash
 # 只覆盖连接参数, 走云端直连 (不用隧道)
-python -m speedtune.rl.train --server_host 1.2.3.4 --server_port 8000
+python -m speedtune.rl.rainbow.train --server_host 1.2.3.4 --server_port 8000
 
 # 切换任务 (需要云端已加载对应 ckpt)
-python -m speedtune.rl.train \
+python -m speedtune.rl.rainbow.train \
   --task_name open_microwave \
   --task_config demo_clean
 ```
@@ -172,11 +157,14 @@ python -m speedtune.rl.train \
 | `envs/_base_task.py:take_chunk_action` | 执行器, 加了 `v` 参数做 chunk reconstruct |
 | `envs/utils/chunk_accel.py` | `reconstruct_chunk(chunk, v)` 实现 |
 | `envs/robot/toppra_chunk_executor.py` | 整段 TOPPRA 时间重参数化 |
-| `speedtune/rl/env.py` | Gym-like env, 包装 RoboTwin + 远端 pi0.5 |
-| `speedtune/rl/networks.py` | SAC actor + twin critic |
-| `speedtune/rl/sac.py` | SAC 主算法 (twin Q + 自动 alpha) |
-| `speedtune/rl/config.py` | 所有超参集中管理 |
-| `speedtune/rl/train.py` | 训练入口 |
+| `speedtune/rl/env.py` | Gym-like env, 包装 RoboTwin + 远端 pi0.5 (SAC/Rainbow 共用) |
+| `speedtune/rl/config.py` | 共享 env/奖励/动作空间/server 配置 |
+| `speedtune/rl/rainbow/networks.py` | FactoredDuelingC51 (dueling + C51 分布式 Q) |
+| `speedtune/rl/rainbow/agent.py` | Rainbow agent (C51 + PER + n-step + noisy) |
+| `speedtune/rl/rainbow/buffer.py` | PER + n-step replay buffer |
+| `speedtune/rl/rainbow/config.py` | Rainbow 专属超参 (C51 / 动作网格 / 训练循环) |
+| `speedtune/rl/rainbow/train.py` | 训练入口 |
+| `speedtune/rl/eval_compare.py` | 评估 / 速度-成功率对比 |
 
 openpi 侧:
 
@@ -210,8 +198,8 @@ openpi 侧:
 6. **GPU 分片**. pi0.5 server 会吃掉绝大多数显存, RoboTwin Sapien
    默认也拿 device 0. 如果单卡紧张, 要么:
    - server 用 `CUDA_VISIBLE_DEVICES=0 docker compose ...`, RL 用
-     `CUDA_VISIBLE_DEVICES=1 python -m speedtune.rl.train`
-   - 或者把 SAC 放 cpu (`--device cpu`), 只让 Sapien 和 pi0.5 抢 GPU0
+     `CUDA_VISIBLE_DEVICES=1 python -m speedtune.rl.rainbow.train`
+   - 或者把 Rainbow agent 放 cpu (`--device cpu`), 只让 Sapien 和 pi0.5 抢 GPU0
 7. **Docker + conda 同机**. docker 容器里 server 监听主机 8000,
    conda 宿主里 client 连 `127.0.0.1:8000`. 这条走的是 loopback, 不需要
    开外网端口. 但如果改 `network_mode: bridge`, 宿主连的就是容器 IP,
