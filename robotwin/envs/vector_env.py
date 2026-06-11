@@ -138,6 +138,27 @@ class SubEnv:
             "info": info,
         }
 
+    def step_with_speed(self, actions, speed):
+        """speedup 版 step: 用整段 TOPPRA + RL 速度元动作 (v, vel_scale, acc_scale) 执行 chunk."""
+        if self.get_instruction() is None:
+            self.reset(env_seed=None)
+
+        v, vel_scale, acc_scale = float(speed[0]), float(speed[1]), float(speed[2])
+        with self.lock:
+            reward, termination, truncation, info = self.task.gen_sparse_reward_data_speedup(
+                actions, vel_scale=vel_scale, acc_scale=acc_scale, v=v
+            )
+            obs = update_obs(self.task.get_obs())
+            obs["instruction"] = self.task.get_instruction()
+
+        return {
+            "obs": obs,
+            "reward": reward,
+            "terminated": termination,
+            "truncated": truncation,
+            "info": info,
+        }
+
     def reset(self, env_seed=None):
         with self.global_lock:
             with self.lock:
@@ -374,6 +395,32 @@ class VectorEnv(gym.Env):
         )
 
         return obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv
+
+    def step_with_speed(self, actions, speed_actions):
+        """speedup 版 step: 每个 env 用整段 TOPPRA + RL 速度元动作执行 chunk.
+
+        Args:
+            actions:       [n_envs, chunk_len, action_dim]  动作 chunk.
+            speed_actions: [n_envs, 3]  每个 env 的 (v, vel_scale, acc_scale).
+        """
+        if len(self.envs) == 0:
+            self._init_envs()
+
+        step_futures = {}
+        for i in range(self.n_envs):
+            future = self.env_thread_pool.submit(
+                self.envs[i].step_with_speed, actions[i], speed_actions[i]
+            )
+            step_futures[i] = future
+
+        results = []
+        for i in range(self.n_envs):
+            try:
+                results.append(step_futures[i].result(timeout=120))
+            except Exception as e:
+                raise RuntimeError(f"SubEnv {i} step_with_speed error: {e}")
+
+        return self.transform(results)
 
     def reset(self, env_idx=None, env_seeds=None):
         if len(self.envs) == 0:
