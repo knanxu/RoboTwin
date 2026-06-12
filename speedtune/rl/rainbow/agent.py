@@ -135,35 +135,26 @@ class RainbowAgent:
         lower = b.floor().long()
         upper = b.ceil().long()
 
-        # Handle the case where b is exactly on a grid point (lower == upper).
-        # In that case redistribute the full mass at lower.
-        lower_eq_upper = (lower == upper)
-        # Adjust to keep mass conservation: shift upper down if at upper bound
+        # Handle b exactly on a grid point (lower == upper): nudge so that the
+        # two scatter weights (u - b) + (b - l) sum to exactly 1.
+        # ⚠️ The two nudges must be SEQUENTIAL — the second test reads the
+        # UPDATED lower, so only one fires per element. Firing both (the old
+        # behaviour, with the equality mask precomputed) gave l=b-1 AND u=b+1
+        # → weights (u-b)=(b-l)=1 each → the atom's mass doubled, and the row
+        # renormalization then squashed the whole distribution's shape.
         upper = torch.where(upper >= self.c51.n_atoms, upper - 1, upper)
-        # Disambiguate by nudging upper up when lower==upper and not at top.
-        # Standard trick:
-        lower = torch.where(
-            lower_eq_upper & (lower > 0),
-            lower - 1,
-            lower,
-        )
+        lower = torch.where((upper > 0) & (lower == upper), lower - 1, lower)
         upper = torch.where(
-            lower_eq_upper & (upper < self.c51.n_atoms - 1),
-            upper + 1,
-            upper,
+            (lower < self.c51.n_atoms - 1) & (lower == upper), upper + 1, upper
         )
 
-        # Distribute probability mass.
+        # Distribute probability mass (now exactly mass-conserving).
         target = torch.zeros_like(next_probs)
         m_l = next_probs * (upper.float() - b)
         m_u = next_probs * (b - lower.float())
-
-        # When lower==upper after the nudge above (only happens at the
-        # boundary), put the full probability mass on that atom.
-        # In practice the (u - b) and (b - l) sum to (u - l) which is >=1
-        # so we re-normalize per row below to be safe.
         target.scatter_add_(1, lower, m_l)
         target.scatter_add_(1, upper, m_u)
+        # Defensive renormalization only (sums are 1 up to float error).
         target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         return target
 

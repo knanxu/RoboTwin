@@ -305,6 +305,10 @@ def main():
         obs = next_obs
 
         if terminated or truncated:
+            # 任何形式的 episode 结束都要排空 n-step 窗口 (terminated 时 add 已排空,
+            # 此调用为空操作; truncated 时不排空会把下个 episode 的 reward/state
+            # 跨 reset 边界折进旧 episode 的尾部 transition).
+            agent.buffer.flush_episode()
             ep_returns.append(ep_return)
             is_success = bool(info.get("success", False))
             ep_successes.append(float(is_success))
@@ -385,6 +389,12 @@ def main():
             print(f"[eval] step {step} ...", flush=True)
             eval_metrics = _eval(env, agent, env_step=step, n_episodes=cfg.train.eval_episodes)
             print(f"[eval] {eval_metrics}", flush=True)
+            # eval 复用了训练 env (内部多次 reset), 训练上下文已失效: 旧 obs 是 stale 的,
+            # env 停在 eval 末态 (可能 eval_success=True) —— 不 reset 的话下一个 train step
+            # 会产生一条带虚假 +1 成功奖励的脏 transition, 且 PER 会优先采样它.
+            agent.buffer.flush_episode()
+            obs, _ = env.reset()
+            ep_return = 0.0
 
             # Wandb: eval metrics
             # 全称命名:

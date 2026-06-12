@@ -138,6 +138,23 @@ class PERNStepBuffer:
             while self._buf:
                 self._flush_oldest()
 
+    def flush_episode(self):
+        """Drain the n-step window at an episode boundary of ANY kind.
+
+        ``add(..., d=True)`` already drains on termination, but truncation
+        (budget exhausted / time limit) arrives with d=False and used to leave
+        the window populated — the next episode's rewards/states then got
+        folded into the old episode's tail transitions across the reset
+        boundary. Call this from the training loop whenever
+        ``terminated or truncated`` before the next ``env.reset()``.
+
+        Tail transitions keep done=False so their targets still bootstrap from
+        the recorded next_state (correct for truncation), just with a shorter
+        fold length n_len.
+        """
+        while self._buf:
+            self._flush_oldest()
+
     def _flush_oldest(self):
         """Pop the oldest transition out of the window and push the
         n-step folded version into the sumtree."""
@@ -201,9 +218,14 @@ class PERNStepBuffer:
 
         td_errors should already be |TD-error| (positive). The buffer
         applies the α exponent internally.
+
+        ``max_priority`` is kept in RAW (pre-α) units: ``_push_one`` applies
+        the α exponent exactly once when inserting. Storing the α-powered
+        value here used to double-apply the exponent (p^α²), systematically
+        underestimating new-sample priorities whenever raw |TD| > 1.
         """
-        prios = np.abs(td_errors) + self.eps
-        prios = prios ** self.alpha
+        raw = np.abs(td_errors) + self.eps
+        prios = raw ** self.alpha
         for idx, p in zip(idxs, prios):
             self.tree.update(int(idx), float(p))
-        self.max_priority = max(self.max_priority, float(prios.max()))
+        self.max_priority = max(self.max_priority, float(raw.max()))

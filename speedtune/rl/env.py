@@ -75,6 +75,9 @@ class ChunkSpeedupEnv:
         self.verbose = verbose
         self._seed = int(seed)
         self._rng = random.Random(self._seed)
+        # reset 失败重试上限 (setup_demo 偶发失败时换 seed 重试; 无上限会无限递归)
+        self._max_reset_retries = 20
+        self._reset_failures = 0
 
         # 动作上下界 (对齐 actor 输出)
         self.action_low = np.array(
@@ -273,7 +276,14 @@ class ChunkSpeedupEnv:
                 self._task_env.close_env()
             except Exception:
                 pass
+            self._reset_failures += 1
+            if self._reset_failures > self._max_reset_retries:
+                raise RuntimeError(
+                    f"setup_demo failed {self._reset_failures} consecutive times "
+                    f"(task={self.env_cfg.task_name}); aborting instead of retrying forever."
+                )
             return self.reset(seed=None)
+        self._reset_failures = 0
 
         instruction = self._task_env.get_instruction()
         if instruction is None:
@@ -348,6 +358,10 @@ class ChunkSpeedupEnv:
         if is_fallback:
             r_v = 0.0
             reward = float(self.reward_cfg.fallback_penalty)
+        elif is_truncated:
+            # 入口截断: chunk 根本没执行 (dense_steps=0), 给速度奖励是错误归因.
+            r_v = 0.0
+            reward = 1.0 if is_success else 0.0
         else:
             r_v = self._reward_speed(action)
             r_task = 1.0 if is_success else 0.0

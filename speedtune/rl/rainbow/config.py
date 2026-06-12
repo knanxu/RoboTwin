@@ -37,7 +37,7 @@ class ActionGridConfig:
 #                  an implicit cost, so the agent still learns to avoid it)
 #   crash additionally terminates the episode.
 #
-# This keeps Q values ≥ 0 so C51 support can sit on [V_min=0, V_max=20].
+# This keeps Q values ≥ 0 so C51 support can sit on [V_min=0, V_max] (见 C51Config).
 @dataclass
 class RewardConfig:
     alpha_v: float = 0.05
@@ -91,14 +91,17 @@ class C51Config:
 
     Plan A reward is non-negative:
       single-chunk r ∈ [0.13, 1.51] (max only at terminal success step)
-      typical r_v per chunk ≈ 0.2~0.4
+      max r_v per chunk = 0.05·1.5² + 0.05·2² + 0.05·4 ≈ 0.51 at full speed
       successful episode ~10-30 chunks, only the last gets r_task=1
-      realistic episode return ≈ 5~7 (with γ=0.99 discounting)
-      V_max=8 covers the practical upper bound with margin.
-      101 atoms → resolution 0.08/atom, very fine-grained.
+      worst-case discounted return (full speed, 30 chunks, γ=0.99):
+        0.51 · (1-0.99³⁰)/0.01 + 1 ≈ 14.3
+      V_max must cover this — a smaller bound (the old 8.0) clamps the Q
+      distribution exactly for sustained-high-speed behaviour, flattening the
+      value signal the task is trying to reward.
+      101 atoms → resolution 0.15/atom, still fine-grained for r ≈ 0.2~0.5.
     """
     v_min: float = 0.0
-    v_max: float = 8.0
+    v_max: float = 15.0
     n_atoms: int = 101
 
 
