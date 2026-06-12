@@ -1681,7 +1681,8 @@ class Base_Task(gym.Env):
             self.viewer.render()
 
 
-    def take_chunk_action(self, action_chunk, vel_scale: float = 1.0, acc_scale: float = 1.0, v: float = 1.0):
+    def take_chunk_action(self, action_chunk, vel_scale: float = 1.0, acc_scale: float = 1.0, v: float = 1.0,
+                          video_save_freq: int = -1):
         """
         整段 TOPPRA 执行器: 对一整段 action chunk 做一次 TOPPRA 时间重参数化,
         按 250Hz (对齐 scene.timestep) 密集采样后逐点下发.
@@ -1700,6 +1701,9 @@ class Base_Task(gym.Env):
             vel_scale, acc_scale: TOPPRA 速度 / 加速度约束倍率.
             v: chunk 压缩重构比率. v=1.0 不压缩; v>1.0 帧数减少 (走得更稀疏);
                v<1.0 帧数增加 (插帧平滑). 压缩后的帧数 M 即为本次消耗的 cnt 预算.
+            video_save_freq: >0 时在物理步循环内每隔该步数采一帧写入 eval 视频
+               (250Hz / 25 = 10fps, 与 eval 视频标称帧率一致, 回放约等于实时).
+               默认 -1 保持原行为: 每次调用只在开头写 1 帧.
 
         Returns:
             info: dict, 执行统计
@@ -1860,6 +1864,17 @@ class Base_Task(gym.Env):
             self.scene.step()
             self._update_render()
             step_taken += 1
+
+            if (video_save_freq > 0 and step_taken % video_save_freq == 0
+                    and self.eval_video_path is not None and hasattr(self, "eval_video_ffmpeg")):
+                try:
+                    self.cameras.update_picture()
+                    rgb = self.cameras.get_rgb()["head_camera"]["rgb"]
+                    if rgb.dtype != np.uint8:
+                        rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+                    self.eval_video_ffmpeg.stdin.write(np.ascontiguousarray(rgb).tobytes())
+                except Exception:
+                    pass
 
             if self.check_success():
                 self.eval_success = True

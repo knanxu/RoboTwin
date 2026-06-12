@@ -10,3 +10,9 @@ instruction_type: unseen
 server_host: 127.0.0.1
 server_port: 8000
 pi0_step: 50
+
+# take_chunk_action 执行参数
+vel_scale: 1.0
+acc_scale: 1.0
+v: 1.0
+video_save_freq: 25  # 250Hz / 25 = 10fps; <=0 时每 chunk 只写首帧

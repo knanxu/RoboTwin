@@ -34,10 +34,14 @@ _websocket_client_policy = _import_openpi_client()
 
 class PI0Client:
 
-    def __init__(self, host, port, pi0_step):
+    def __init__(self, host, port, pi0_step, vel_scale=1.0, acc_scale=1.0, v=1.0, video_save_freq=25):
         print(f"connecting to policy server at {host}:{port} ...")
         self.client = _websocket_client_policy.WebsocketClientPolicy(host=host, port=int(port))
         self.pi0_step = int(pi0_step)
+        self.vel_scale = float(vel_scale)
+        self.acc_scale = float(acc_scale)
+        self.v = float(v)
+        self.video_save_freq = int(video_save_freq)
         self.instruction = None
 
     def set_language(self, instruction):
@@ -72,7 +76,15 @@ def encode_obs(observation):
 
 
 def get_model(usr_args):
-    return PI0Client(usr_args["server_host"], usr_args["server_port"], usr_args["pi0_step"])
+    return PI0Client(
+        usr_args["server_host"],
+        usr_args["server_port"],
+        usr_args["pi0_step"],
+        vel_scale=usr_args.get("vel_scale", 1.0),
+        acc_scale=usr_args.get("acc_scale", 1.0),
+        v=usr_args.get("v", 1.0),
+        video_save_freq=usr_args.get("video_save_freq", 25),
+    )
 
 
 def eval(TASK_ENV, model, observation):
@@ -82,8 +94,15 @@ def eval(TASK_ENV, model, observation):
     input_rgb_arr, input_state = encode_obs(observation)
     actions = model.get_action(input_rgb_arr, input_state)[:model.pi0_step]
 
-    for action in actions:
-        TASK_ENV.take_action(action)
+    # 整段 chunk 一次 TOPPRA 重参数化后密集执行 (对齐 speedtune 的执行方式),
+    # 内部按物理步检查 check_success 并消耗 take_action_cnt 预算.
+    TASK_ENV.take_chunk_action(
+        actions,
+        vel_scale=model.vel_scale,
+        acc_scale=model.acc_scale,
+        v=model.v,
+        video_save_freq=model.video_save_freq,
+    )
 
 
 def reset_model(model):
