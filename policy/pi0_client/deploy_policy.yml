@@ -1,0 +1,12 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Add Parameters You Need
+server_host: 127.0.0.1
+server_port: 8000
+pi0_step: 50
