@@ -28,3 +28,6 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+
+# codegraph index (local tooling, large .db)
+.codegraph/
