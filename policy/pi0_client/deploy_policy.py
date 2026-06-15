@@ -94,9 +94,10 @@ def eval(TASK_ENV, model, observation):
     input_rgb_arr, input_state = encode_obs(observation)
     actions = model.get_action(input_rgb_arr, input_state)[:model.pi0_step]
 
-    # 整段 chunk 一次 TOPPRA 重参数化后密集执行 (对齐 speedtune 的执行方式),
-    # 内部按物理步检查 check_success 并消耗 take_action_cnt 预算.
-    TASK_ENV.take_chunk_action(
+    # 按 TASK_ENV.exec_backend 选择三种执行后端 (streaming/per_action/whole_chunk),
+    # 由 eval 脚本设置, 缺省 whole_chunk = 整段 TOPPRA (原行为). 内部按物理步检查
+    # check_success 并消耗 take_action_cnt 预算. B/C 的 vel/acc 缺省为 1.0.
+    TASK_ENV.take_chunk_action_backend(
         actions,
         vel_scale=model.vel_scale,
         acc_scale=model.acc_scale,

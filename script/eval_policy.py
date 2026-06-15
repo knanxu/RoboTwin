@@ -121,7 +121,10 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    if usr_args.get("save_dir"):
+        save_dir = Path(usr_args["save_dir"])
+    else:
+        save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args["eval_video_log"]:
@@ -151,6 +154,12 @@ def main(usr_args):
     print("\n==================================")
 
     TASK_ENV = class_decorator(args["task_name"])
+    # 选择三种动作执行后端 (设到 TASK_ENV, deploy_policy 的 take_chunk_action_backend 读取).
+    # 缺省 whole_chunk = 整段 TOPPRA (原行为不变). B/C 的 vel/acc 默认保持 1.0.
+    TASK_ENV.exec_backend = usr_args.get("exec_backend", "whole_chunk")
+    TASK_ENV.stream_hold_steps = int(usr_args.get("stream_hold_steps", 5))
+    print(f"\033[96m[exec] backend={TASK_ENV.exec_backend} "
+          f"stream_hold_steps={TASK_ENV.stream_hold_steps}\033[0m")
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
@@ -327,6 +336,14 @@ def eval_policy(task_name,
 def parse_args_and_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--exec_backend", type=str, default=None,
+                        choices=["streaming", "per_action", "whole_chunk"],
+                        help="动作执行后端: streaming(论文式A) | per_action(RoboTwin原生B) | "
+                             "whole_chunk(整段TOPPRA C, 默认). B/C 的 TOPPRA vel/acc 默认保持 1.0.")
+    parser.add_argument("--stream_hold_steps", type=int, default=None,
+                        help="后端 A 每个目标 hold 的物理步数 (250/H=控制频率, 默认 5=50Hz).")
+    parser.add_argument("--save_dir", type=str, default=None,
+                        help="覆盖默认 eval_result 输出目录 (对比脚本用: 把三种后端写到同一对比文件夹下).")
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -349,6 +366,14 @@ def parse_args_and_config():
     if args.overrides:
         overrides = parse_override_pairs(args.overrides)
         config.update(overrides)
+
+    # 显式 flag 优先于 config/overrides
+    if args.exec_backend is not None:
+        config["exec_backend"] = args.exec_backend
+    if args.stream_hold_steps is not None:
+        config["stream_hold_steps"] = args.stream_hold_steps
+    if args.save_dir is not None:
+        config["save_dir"] = args.save_dir
 
     return config
 

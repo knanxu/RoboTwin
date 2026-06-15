@@ -33,8 +33,8 @@ class RainbowAgent:
     def __init__(
         self,
         state_dim: int,
-        num_actions_per_dim: Tuple[int, int, int],
-        action_grids: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        num_actions_per_dim: Tuple[int, ...],     # 1 (scalar_v) 或 3 (v_vel_acc)
+        action_grids: Tuple[np.ndarray, ...],
         c51_cfg: C51Config,
         rainbow_cfg: RainbowConfig,
         net_cfg: NetworkConfig,
@@ -79,6 +79,7 @@ class RainbowAgent:
             n_step=rainbow_cfg.n_step,
             gamma=rainbow_cfg.gamma,
             alpha=rainbow_cfg.per_alpha,
+            num_action_dims=len(self.num_actions_per_dim),
             eps=rainbow_cfg.per_eps,
             device=device,
         )

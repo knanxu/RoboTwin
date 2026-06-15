@@ -1489,7 +1489,7 @@ class Base_Task(gym.Env):
                 调用结束后自动恢复.
         """
         if self.take_action_cnt == self.step_lim or self.eval_success:
-            return
+            return 0
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
@@ -1638,6 +1638,7 @@ class Base_Task(gym.Env):
         right_gripper = np.array(right_gripper)
 
         now_left_id, now_right_id = 0, 0
+        dense_steps_taken = 0   # 实际下发的物理步数 (供后端 B 累加 episode 真实执行时间)
 
         # ========== Control Loop ==========
         while now_left_id < left_n_step or now_right_id < right_n_step:
@@ -1666,7 +1667,8 @@ class Base_Task(gym.Env):
 
             self.scene.step()
             self._update_render()
-                
+            dense_steps_taken += 1
+
             if self.check_success():
                 self.eval_success = True
                 _t_obs = time.perf_counter()
@@ -1674,11 +1676,12 @@ class Base_Task(gym.Env):
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 self._last_success_obs_time = time.perf_counter() - _t_obs
-                return
+                return dense_steps_taken
 
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()
+        return dense_steps_taken
 
 
     def take_chunk_action(self, action_chunk, vel_scale: float = 1.0, acc_scale: float = 1.0, v: float = 1.0,
@@ -1896,6 +1899,232 @@ class Base_Task(gym.Env):
         if self.render_freq:
             self.viewer.render()
         return info
+
+    def take_chunk_action_per_action(self, action_chunk, vel_scale: float = 1.0,
+                                     acc_scale: float = 1.0, v: float = 1.0):
+        """后端 B: RoboTwin 原生逐 action 点到点 TOPP 执行 (复用 take_action), 外露 vel/acc.
+
+        先按 v 线性插值压缩 chunk, 再把压缩后的每个 action 依次交给 take_action 执行.
+        每个 action 是 [current → target] 两点 TOPP, 首尾零速 = stop-and-go (保持
+        RoboTwin 原生行为). vel_scale/acc_scale 经 take_action 的 scaled_limits 放大
+        mplib base(1.0) 约束; 物理上限由动作格点上界 ≤ 3.0 保证.
+
+        返回与 take_chunk_action 统一的 info dict.
+        """
+        info = {
+            "status": "success",
+            "fallback_reason": None,
+            "duration": 0.0,
+            "dense_steps": 0,
+            "take_action_cnt_delta": 0,
+            "topp_return_code": None,
+            "success_obs_time": 0.0,
+        }
+        if self.take_action_cnt >= self.step_lim or self.eval_success:
+            info["status"] = "truncated"
+            return info
+
+        action_chunk = np.asarray(action_chunk)
+        if action_chunk.ndim != 2 or action_chunk.shape[0] == 0:
+            info["status"] = "topp_fallback"
+            info["fallback_reason"] = f"invalid chunk shape: {action_chunk.shape}"
+            return info
+
+        if v != 1.0:
+            from .utils.chunk_accel import reconstruct_chunk
+            action_chunk = reconstruct_chunk(action_chunk, float(v))
+            if action_chunk.shape[0] == 0:
+                info["status"] = "topp_fallback"
+                info["fallback_reason"] = f"reconstruct_chunk produced empty chunk at v={v}"
+                return info
+
+        remaining_budget = int(self.step_lim - self.take_action_cnt)
+        if action_chunk.shape[0] > remaining_budget:
+            action_chunk = action_chunk[:remaining_budget]
+            info["chunk_truncated"] = True
+            if action_chunk.shape[0] == 0:
+                info["status"] = "truncated"
+                return info
+
+        M = int(action_chunk.shape[0])
+        dense_steps = 0
+        executed = 0
+        _t_obs0 = float(getattr(self, "_last_success_obs_time", 0.0))
+        for i in range(M):
+            if self.take_action_cnt >= self.step_lim or self.eval_success:
+                break
+            n = self.take_action(action_chunk[i], action_type="qpos",
+                                 vel_scale=vel_scale, acc_scale=acc_scale)
+            dense_steps += int(n or 0)
+            executed += 1
+            if self.eval_success:
+                break
+
+        info["dense_steps"] = dense_steps
+        info["duration"] = dense_steps / 250.0
+        info["take_action_cnt_delta"] = executed
+        # take_action 在 success 分支里更新了 self._last_success_obs_time; 取增量
+        info["success_obs_time"] = max(
+            0.0, float(getattr(self, "_last_success_obs_time", 0.0)) - _t_obs0
+        )
+        return info
+
+    def take_chunk_action_streaming(self, action_chunk, v: float = 1.0,
+                                   hold_steps: int = 5, video_save_freq: int = -1):
+        """后端 A: 论文式固定时长流式执行 (无 TOPP), 忠实 SpeedTuning baseline.
+
+        reconstruct(v) → 逐个关节目标按固定频率流式下发, 每个目标 hold `hold_steps`
+        个物理步 (250Hz / hold_steps = 控制频率; hold_steps=5 → 50Hz 模拟论文 ALOHA).
+        位置命令在 [q_i, q_{i+1}] 间按 250Hz 线性插值, 速度前馈 vel_ff=(q_{i+1}-q_i)*rate
+        (非零, 连续速度, 防 stop-and-go; 底层 PD 连续追一个移动目标). 不经 TOPP, 不钳
+        物理上限 (PD 跟踪能力即隐式约束, 忠实论文的 speed-success 权衡).
+
+        返回与 take_chunk_action 统一的 info dict (status='success'|'truncated', 无 fallback).
+        """
+        info = {
+            "status": "success",
+            "fallback_reason": None,
+            "duration": 0.0,
+            "dense_steps": 0,
+            "take_action_cnt_delta": 0,
+            "topp_return_code": None,
+            "success_obs_time": 0.0,
+        }
+        if self.take_action_cnt >= self.step_lim or self.eval_success:
+            info["status"] = "truncated"
+            return info
+
+        action_chunk = np.asarray(action_chunk)
+        if action_chunk.ndim != 2 or action_chunk.shape[0] == 0:
+            info["status"] = "truncated"
+            info["fallback_reason"] = f"invalid chunk shape: {action_chunk.shape}"
+            return info
+
+        if v != 1.0:
+            from .utils.chunk_accel import reconstruct_chunk
+            action_chunk = reconstruct_chunk(action_chunk, float(v))
+            if action_chunk.shape[0] == 0:
+                info["status"] = "truncated"
+                return info
+
+        remaining_budget = int(self.step_lim - self.take_action_cnt)
+        if action_chunk.shape[0] > remaining_budget:
+            action_chunk = action_chunk[:remaining_budget]
+            info["chunk_truncated"] = True
+            if action_chunk.shape[0] == 0:
+                info["status"] = "truncated"
+                return info
+
+        M = int(action_chunk.shape[0])
+
+        left_jointstate = self.robot.get_left_arm_jointState()
+        right_jointstate = self.robot.get_right_arm_jointState()
+        left_arm_dim = len(left_jointstate) - 1
+        right_arm_dim = len(right_jointstate) - 1
+
+        left_arm = action_chunk[:, :left_arm_dim]
+        left_gripper = action_chunk[:, left_arm_dim]
+        right_arm = action_chunk[:, left_arm_dim + 1 : left_arm_dim + 1 + right_arm_dim]
+        right_gripper = action_chunk[:, left_arm_dim + 1 + right_arm_dim]
+
+        H = max(1, int(hold_steps))
+        rate = 250.0 / H   # 等效控制频率 (Hz)
+
+        self.take_action_cnt += M
+        info["take_action_cnt_delta"] = M
+        print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m  (stream M={M}, H={H})", end="\r")
+
+        if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
+            try:
+                self.eval_video_ffmpeg.stdin.write(
+                    self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+            except Exception:
+                pass
+
+        dense_steps = 0
+        for i in range(M):
+            q_left_0, q_right_0 = left_arm[i], right_arm[i]
+            if i + 1 < M:
+                q_left_1, q_right_1 = left_arm[i + 1], right_arm[i + 1]
+            else:
+                q_left_1, q_right_1 = q_left_0, q_right_0
+            left_vel = (q_left_1 - q_left_0) * rate
+            right_vel = (q_right_1 - q_right_0) * rate
+
+            for h in range(H):
+                self._update_render()
+                if self.render_freq:
+                    self.viewer.render()
+                frac = (h + 1) / H
+                q_left = q_left_0 + frac * (q_left_1 - q_left_0)
+                q_right = q_right_0 + frac * (q_right_1 - q_right_0)
+                self.robot.set_arm_joints(q_left, left_vel, "left")
+                self.robot.set_gripper(float(left_gripper[i]), "left")
+                self.robot.set_arm_joints(q_right, right_vel, "right")
+                self.robot.set_gripper(float(right_gripper[i]), "right")
+
+                self.scene.step()
+                self._update_render()
+                dense_steps += 1
+
+                if (video_save_freq > 0 and dense_steps % video_save_freq == 0
+                        and self.eval_video_path is not None and hasattr(self, "eval_video_ffmpeg")):
+                    try:
+                        self.cameras.update_picture()
+                        rgb = self.cameras.get_rgb()["head_camera"]["rgb"]
+                        if rgb.dtype != np.uint8:
+                            rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+                        self.eval_video_ffmpeg.stdin.write(np.ascontiguousarray(rgb).tobytes())
+                    except Exception:
+                        pass
+
+                if self.check_success():
+                    self.eval_success = True
+                    _t_obs = time.perf_counter()
+                    self.get_obs()
+                    if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
+                        try:
+                            self.eval_video_ffmpeg.stdin.write(
+                                self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                        except Exception:
+                            pass
+                    info["success_obs_time"] = time.perf_counter() - _t_obs
+                    info["dense_steps"] = dense_steps
+                    info["duration"] = dense_steps / 250.0
+                    self._update_render()
+                    return info
+
+        info["dense_steps"] = dense_steps
+        info["duration"] = dense_steps / 250.0
+        self._update_render()
+        if self.render_freq:
+            self.viewer.render()
+        return info
+
+    def take_chunk_action_backend(self, action_chunk, vel_scale: float = 1.0,
+                                  acc_scale: float = 1.0, v: float = 1.0,
+                                  video_save_freq: int = -1):
+        """eval 用统一执行入口: 按 self.exec_backend 选择三种动作执行后端.
+
+          "streaming"   后端 A: 论文式固定时长流式 (无 TOPP), 用 self.stream_hold_steps;
+                        vel/acc 不适用 (不钳物理上限, 忠实论文).
+          "per_action"  后端 B: RoboTwin 原生逐 action 点到点 TOPP, 外露 vel/acc.
+          "whole_chunk" 后端 C (默认): 整段 TOPPRA. 保持原行为.
+
+        self.exec_backend / self.stream_hold_steps 由 eval 脚本设到 TASK_ENV 上
+        (缺省 whole_chunk / 5, 故未设置时与改动前行为一致).
+        """
+        backend = getattr(self, "exec_backend", "whole_chunk")
+        hold = int(getattr(self, "stream_hold_steps", 5))
+        if backend == "streaming":
+            return self.take_chunk_action_streaming(
+                action_chunk, v=v, hold_steps=hold, video_save_freq=video_save_freq)
+        if backend == "per_action":
+            return self.take_chunk_action_per_action(
+                action_chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v)
+        return self.take_chunk_action(
+            action_chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+            video_save_freq=video_save_freq)
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):

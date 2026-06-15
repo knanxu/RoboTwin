@@ -41,7 +41,7 @@ class FactoredDuelingC51(nn.Module):
     def __init__(
         self,
         state_dim: int,
-        num_actions_per_dim: Tuple[int, int, int],   # (K_v, K_vs, K_as)
+        num_actions_per_dim: Tuple[int, ...],   # 1 (K_v,) 或 3 (K_v, K_vs, K_as)
         n_atoms: int,
         v_min: float,
         v_max: float,

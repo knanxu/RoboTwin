@@ -19,9 +19,22 @@ from typing import Tuple
 # to keep |A| tractable: 8 + 6 + 7 = 21 Q-logits in factored mode.
 @dataclass
 class ActionGridConfig:
+    # action_mode: "scalar_v" (后端 A, 论文式, 只用 v) | "v_vel_acc" (后端 B/C)
+    action_mode: str = "v_vel_acc"
     v_grid: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5)
-    vel_grid: Tuple[float, ...] = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
-    acc_grid: Tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
+    # vel/acc 上界对应 base(1.0)×scale ≤ 物理天花板(3.0) (原 2.0/4.0; acc=4.0 超物理上限)
+    vel_grid: Tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0)
+    acc_grid: Tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0)
+
+    def active_grids(self) -> Tuple[Tuple[float, ...], ...]:
+        if self.action_mode == "scalar_v":
+            return (self.v_grid,)
+        return (self.v_grid, self.vel_grid, self.acc_grid)
+
+    def dim_names(self) -> Tuple[str, ...]:
+        if self.action_mode == "scalar_v":
+            return ("v",)
+        return ("v", "vel_scale", "acc_scale")
 
 
 # ----------------------------------------------------------------------
@@ -40,15 +53,23 @@ class ActionGridConfig:
 # This keeps Q values ≥ 0 so C51 support can sit on [V_min=0, V_max] (见 C51Config).
 @dataclass
 class RewardConfig:
+    # reward_mode: "knob" (论文式 α·v^β+r_task; 仅后端 A 安全) | "time" (真实时间惩罚, 防 hack)
+    reward_mode: str = "knob"
+
+    # --- knob mode ---
     alpha_v: float = 0.05
     alpha_vs: float = 0.05
     alpha_as: float = 0.05
     beta_v: float = 2.0
     beta_vs: float = 2.0
     beta_as: float = 1.0
+    fallback_penalty: float = 0.0    # knob: 不给负 penalty
+    crash_penalty: float = 0.0       # knob: 不给负 penalty (仅 terminal)
 
-    fallback_penalty: float = 0.0    # 方案 A: 不再给负 penalty
-    crash_penalty: float = 0.0       # 方案 A: 不再给负 penalty (仅 terminal)
+    # --- time mode ---
+    alpha_time: float = 0.3          # 时间惩罚系数 (Pareto 旋钮)
+    fallback_seconds: float = 4.0    # time: fallback 计为这么多秒 (防故意触发)
+    crash_seconds: float = 8.0       # time: crash 计为这么多秒
 
 
 # ----------------------------------------------------------------------
@@ -62,8 +83,14 @@ class EnvConfig:
     chunk_size: int = 50
     max_chunks_per_episode: int = 100
 
+    # exec_backend: "streaming" (A) | "per_action" (B) | "whole_chunk" (C)
+    exec_backend: str = "whole_chunk"
+    stream_hold_steps: int = 5            # 后端 A: 每目标 hold 物理步数 (250/5=50Hz)
+
     cond_emb_dim: int = 2048
-    state_dim: int = 2048 + 3 + 1 + 1     # cond_emb + last_action + cnt + last_fallback
+    # state_dim 由 env 按 action_mode 实际计算 (cond_emb + action_dim + 2); 训练时
+    # 用 env.state_dim 构建 agent. 这里默认值仅作 v_vel_acc 情形参考.
+    state_dim: int = 2048 + 3 + 1 + 1
 
 
 @dataclass
@@ -160,3 +187,35 @@ class FullConfig:
     c51: C51Config = field(default_factory=C51Config)
     rainbow: RainbowConfig = field(default_factory=RainbowConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+
+    @classmethod
+    def preset(cls, mode: str) -> "FullConfig":
+        """三个对比预设. 仍可被 CLI / 后续覆盖单个字段 (如 A 切 time 奖励).
+
+          paper_A: 后端 A 论文式流式 + 标量 v + 论文 knob 奖励 (忠实 SpeedTune baseline)
+          ours_B : 后端 B 逐 action TOPP + (v,vel,acc) + 时间奖励
+          ours_C : 后端 C 整段 TOPPRA + (v,vel,acc) + 时间奖励 (本工作方法)
+        """
+        cfg = cls()
+        if mode == "paper_A":
+            cfg.env.exec_backend = "streaming"
+            cfg.action_grid.action_mode = "scalar_v"
+            # 论文式 baseline v 取更宽范围 (覆盖加速/减速), 因 A 里 v 线性控时间
+            cfg.action_grid.v_grid = (0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0)
+            cfg.reward.reward_mode = "knob"        # A 上安全且忠实 (beta≥1 防 hack)
+            cfg.c51.v_min, cfg.c51.v_max = 0.0, 15.0
+        elif mode == "ours_B":
+            cfg.env.exec_backend = "per_action"
+            cfg.action_grid.action_mode = "v_vel_acc"
+            cfg.reward.reward_mode = "time"        # B/C 默认时间奖励 (防 hack)
+            cfg.c51.v_min, cfg.c51.v_max = -20.0, 2.0
+        elif mode == "ours_C":
+            cfg.env.exec_backend = "whole_chunk"
+            cfg.action_grid.action_mode = "v_vel_acc"
+            cfg.reward.reward_mode = "time"
+            cfg.c51.v_min, cfg.c51.v_max = -20.0, 2.0
+        else:
+            raise ValueError(
+                f"unknown preset mode: {mode!r} (expect paper_A | ours_B | ours_C)"
+            )
+        return cfg

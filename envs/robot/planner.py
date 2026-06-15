@@ -11,6 +11,13 @@ from contextlib import contextmanager
 import envs._GLOBAL_CONFIGS as CONFIGS
 
 
+# 物理天花板 (ARX5 / aloha-agilex), scaled_limits 放大后不允许超过.
+# acc=3.0 来自 curobo_left.yml:86 (权威), vel=3.0 工程估计. 与
+# envs/robot/toppra_chunk_executor.py 的 PHYS_*_CEIL 保持一致.
+PHYS_VEL_CEIL = 3.0   # rad/s
+PHYS_ACC_CEIL = 3.0   # rad/s^2
+
+
 try:
     # ********************** CuroboPlanner (optional) **********************
     from curobo.types.math import Pose as CuroboPose
@@ -334,8 +341,10 @@ class MplibPlanner:
         orig_vel = np.array(p.joint_vel_limits, copy=True)
         orig_acc = np.array(p.joint_acc_limits, copy=True)
         try:
-            p.joint_vel_limits = orig_vel * vel_scale
-            p.joint_acc_limits = orig_acc * acc_scale
+            # 放大后钳到物理天花板, 保证不超物理限制 (后端 B backstop;
+            # 主防线是 RL 动作格点上界 ≤ 物理上限).
+            p.joint_vel_limits = np.minimum(orig_vel * vel_scale, PHYS_VEL_CEIL)
+            p.joint_acc_limits = np.minimum(orig_acc * acc_scale, PHYS_ACC_CEIL)
             yield
         finally:
             p.joint_vel_limits = orig_vel

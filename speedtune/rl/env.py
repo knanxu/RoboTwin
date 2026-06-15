@@ -79,22 +79,34 @@ class ChunkSpeedupEnv:
         self._max_reset_retries = 20
         self._reset_failures = 0
 
-        # 动作上下界 (对齐 actor 输出)
-        self.action_low = np.array(
-            [action_cfg.v_low, action_cfg.vel_low, action_cfg.acc_low], dtype=np.float32
-        )
-        self.action_high = np.array(
-            [action_cfg.v_high, action_cfg.vel_high, action_cfg.acc_high], dtype=np.float32
-        )
-        self.action_dim = 3
+        # 动作上下界 (对齐 actor 输出). action_mode 决定维度:
+        #   "scalar_v"  -> [v]            (后端 A, 论文式)
+        #   "v_vel_acc" -> [v, vel, acc]  (后端 B/C)
+        self.action_mode = getattr(action_cfg, "action_mode", "v_vel_acc")
+        if self.action_mode == "scalar_v":
+            self.action_low = np.array([action_cfg.v_low], dtype=np.float32)
+            self.action_high = np.array([action_cfg.v_high], dtype=np.float32)
+        else:
+            self.action_low = np.array(
+                [action_cfg.v_low, action_cfg.vel_low, action_cfg.acc_low], dtype=np.float32
+            )
+            self.action_high = np.array(
+                [action_cfg.v_high, action_cfg.vel_high, action_cfg.acc_high], dtype=np.float32
+            )
+        self.action_dim = int(self.action_low.shape[0])
 
-        self.state_dim = env_cfg.state_dim
+        # 执行后端 & 论文式流式参数
+        self.exec_backend = getattr(env_cfg, "exec_backend", "whole_chunk")
+        self.stream_hold_steps = int(getattr(env_cfg, "stream_hold_steps", 5))
+
+        # state = cond_emb + last_action(action_dim) + cnt(1) + last_fallback(1)
+        self.state_dim = env_cfg.cond_emb_dim + self.action_dim + 2
 
         # 内部状态
         self._task_env = None
         self._task_args = None       # 缓存 build 出的 args, 给 setup_demo 用
         self._chunk_idx = 0
-        self._last_action = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        self._last_action = np.ones(self.action_dim, dtype=np.float32)
         self._last_fallback = 0.0
         self._latest_cond_emb = None   # 上次 pi0.5 推理 pool 后 (cond_emb_dim,)
         self._latest_chunk = None      # 上次推理出的 chunk (T, action_dim)
@@ -243,13 +255,48 @@ class ChunkSpeedupEnv:
     # reward
     # ------------------------------------------------------------------
     def _reward_speed(self, action: np.ndarray) -> float:
-        v, vs, a_s = float(action[0]), float(action[1]), float(action[2])
+        """knob 奖励的速度项. A (scalar_v) 只有 v; B/C 加 vel/acc 两项."""
         rc = self.reward_cfg
-        return (
-            rc.alpha_v * (v ** rc.beta_v)
-            + rc.alpha_vs * (vs ** rc.beta_vs)
-            + rc.alpha_as * (a_s ** rc.beta_as)
-        )
+        v = float(action[0])
+        r = rc.alpha_v * (v ** rc.beta_v)
+        if action.shape[0] >= 3:
+            vs, a_s = float(action[1]), float(action[2])
+            r += rc.alpha_vs * (vs ** rc.beta_vs) + rc.alpha_as * (a_s ** rc.beta_as)
+        return r
+
+    def _compute_reward(self, action: np.ndarray, chunk_info: Dict[str, Any],
+                        is_success: bool) -> Tuple[float, float]:
+        """按 reward_mode 算 (reward, r_v). r_v 仅用于日志.
+
+        time 模式: r = -alpha_time·(dense_steps/sim_hz) + 1{success}; fallback 按
+          fallback_seconds 计时 (防 agent 故意触发 fallback 逃避时间惩罚). 防 hack.
+        knob 模式: 论文式 alpha·v^beta(+vel/acc) + r_task; fallback/truncated 特判.
+          ⚠️ 仅后端 A 安全; B/C 用此为消融 (会 reward-hack, 见 config.RewardConfig).
+        """
+        rc = self.reward_cfg
+        status = chunk_info.get("status", "success")
+        if rc.reward_mode == "time":
+            if status == "topp_fallback":
+                t = float(rc.fallback_seconds)
+            else:
+                t = float(chunk_info.get("dense_steps", 0)) / self._sim_hz
+            r_time = -float(rc.alpha_time) * t
+            return r_time + (1.0 if is_success else 0.0), r_time
+        # knob mode
+        if status == "topp_fallback":
+            return float(rc.fallback_penalty), 0.0
+        if status == "truncated":
+            # 入口截断: chunk 没执行 (dense_steps=0), 给速度奖励是错误归因.
+            return (1.0 if is_success else 0.0), 0.0
+        r_v = self._reward_speed(action)
+        return r_v + (1.0 if is_success else 0.0), r_v
+
+    def _crash_reward(self) -> float:
+        """环境崩溃的 terminal 奖励 (按 reward_mode)."""
+        rc = self.reward_cfg
+        if rc.reward_mode == "time":
+            return -float(rc.alpha_time) * float(rc.crash_seconds)
+        return float(rc.crash_penalty)
 
     # ------------------------------------------------------------------
     # gym-like API
@@ -299,7 +346,7 @@ class ChunkSpeedupEnv:
         self._latest_chunk = chunk
         self._latest_cond_emb = cond
         self._chunk_idx = 0
-        self._last_action = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        self._last_action = np.ones(self.action_dim, dtype=np.float32)
         self._last_fallback = 0.0
         self._episode_total_time = 0.0
         self._episode_step_count = 0
@@ -315,7 +362,11 @@ class ChunkSpeedupEnv:
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         action = np.clip(action.astype(np.float32), self.action_low, self.action_high)
-        v, vel_scale, acc_scale = float(action[0]), float(action[1]), float(action[2])
+        v = float(action[0])
+        if self.action_dim >= 3:
+            vel_scale, acc_scale = float(action[1]), float(action[2])
+        else:
+            vel_scale, acc_scale = 1.0, 1.0   # scalar_v (后端 A) 不用 vel/acc
         chunk = self._latest_chunk
 
         info: Dict[str, Any] = {"action": action.tolist()}
@@ -326,16 +377,25 @@ class ChunkSpeedupEnv:
 
         try:
             _t_exec = time.perf_counter()
-            chunk_info = self._task_env.take_chunk_action(
-                chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
-            )
+            if self.exec_backend == "streaming":
+                chunk_info = self._task_env.take_chunk_action_streaming(
+                    chunk, v=v, hold_steps=self.stream_hold_steps
+                )
+            elif self.exec_backend == "per_action":
+                chunk_info = self._task_env.take_chunk_action_per_action(
+                    chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
+                )
+            else:  # "whole_chunk"
+                chunk_info = self._task_env.take_chunk_action(
+                    chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
+                )
             self._episode_chunk_exec_time += time.perf_counter() - _t_exec
         except Exception as e:
             info["error"] = repr(e)
             self._finalize_wall_time()
             return (
                 self._assemble_state(self._latest_cond_emb),
-                self.reward_cfg.crash_penalty,
+                self._crash_reward(),
                 True,
                 False,
                 info,
@@ -354,18 +414,8 @@ class ChunkSpeedupEnv:
         is_truncated = status == "truncated"
         is_success = bool(self._task_env.eval_success)
 
-        # ---- reward ----
-        if is_fallback:
-            r_v = 0.0
-            reward = float(self.reward_cfg.fallback_penalty)
-        elif is_truncated:
-            # 入口截断: chunk 根本没执行 (dense_steps=0), 给速度奖励是错误归因.
-            r_v = 0.0
-            reward = 1.0 if is_success else 0.0
-        else:
-            r_v = self._reward_speed(action)
-            r_task = 1.0 if is_success else 0.0
-            reward = r_v + r_task
+        # ---- reward (reward_mode: knob | time, 见 _compute_reward) ----
+        reward, r_v = self._compute_reward(action, chunk_info, is_success)
         info["r_v"] = r_v
         info["r_total"] = reward
         info["success"] = is_success

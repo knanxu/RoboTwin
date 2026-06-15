@@ -19,6 +19,13 @@ import toppra.constraint as cst
 import toppra.algorithm as algo
 
 
+# 物理天花板 (ARX5 / aloha-agilex). vel_scale/acc_scale 放大 base 约束后, 不允许
+# 超过这两个值: acc=3.0 来自 curobo_left.yml:86 (权威), vel=3.0 为工程估计.
+# 主防线是动作格点上界 (config.PHYS_*_CEIL), 这里是执行层 backstop.
+PHYS_VEL_CEIL: float = 3.0   # rad/s
+PHYS_ACC_CEIL: float = 3.0   # rad/s^2
+
+
 def retime_chunk(
     current_state_arm: np.ndarray,
     chunk_arm: np.ndarray,
@@ -29,6 +36,8 @@ def retime_chunk(
     vel_scale: float = 1.0,
     acc_scale: float = 1.0,
     exec_hz: int = 250,
+    phys_vel_ceil: float = PHYS_VEL_CEIL,
+    phys_acc_ceil: float = PHYS_ACC_CEIL,
 ):
     """
     对整段 chunk 做一次 TOPPRA, 返回密集采样的目标位置 / 速度 / gripper / 时长.
@@ -104,9 +113,11 @@ def retime_chunk(
         path_s,
     )
 
-    # 5. TOPPRA 求解 (应用 scale)
+    # 5. TOPPRA 求解 (应用 scale, 再钳到物理天花板, 保证不超物理限制)
     vel_lim = np.asarray(joint_vel_limits, dtype=np.float64) * float(vel_scale)
     acc_lim = np.asarray(joint_acc_limits, dtype=np.float64) * float(acc_scale)
+    vel_lim = np.minimum(vel_lim, float(phys_vel_ceil))
+    acc_lim = np.minimum(acc_lim, float(phys_acc_ceil))
     if vel_lim.shape[0] != kept_arm.shape[1] or acc_lim.shape[0] != kept_arm.shape[1]:
         return fail(
             f"limits dof mismatch: vel={vel_lim.shape} acc={acc_lim.shape} path_dof={kept_arm.shape[1]}"

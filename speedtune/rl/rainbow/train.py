@@ -71,6 +71,7 @@ def _override_config(cfg: FullConfig, args: argparse.Namespace) -> FullConfig:
 def _to_sac_action_space(cfg: FullConfig):
     grids = cfg.action_grid
     return _SACActionSpaceConfig(
+        action_mode=grids.action_mode,
         v_low=float(grids.v_grid[0]),
         v_high=float(grids.v_grid[-1]),
         vel_low=float(grids.vel_grid[0]),
@@ -83,9 +84,12 @@ def _to_sac_action_space(cfg: FullConfig):
 def _to_sac_reward(cfg: FullConfig):
     rc = cfg.reward
     return _SACRewardConfig(
+        reward_mode=rc.reward_mode,
         alpha_v=rc.alpha_v, alpha_vs=rc.alpha_vs, alpha_as=rc.alpha_as,
         beta_v=rc.beta_v, beta_vs=rc.beta_vs, beta_as=rc.beta_as,
         fallback_penalty=rc.fallback_penalty, crash_penalty=rc.crash_penalty,
+        alpha_time=rc.alpha_time, fallback_seconds=rc.fallback_seconds,
+        crash_seconds=rc.crash_seconds,
     )
 
 
@@ -97,6 +101,8 @@ def _to_sac_env(cfg: FullConfig):
         instruction_type=ec.instruction_type,
         chunk_size=ec.chunk_size,
         max_chunks_per_episode=ec.max_chunks_per_episode,
+        exec_backend=ec.exec_backend,
+        stream_hold_steps=ec.stream_hold_steps,
         cond_emb_dim=ec.cond_emb_dim,
         state_dim=ec.state_dim,
     )
@@ -150,6 +156,13 @@ def _eval(env: ChunkSpeedupEnv, agent: RainbowAgent, env_step: int, n_episodes: 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["paper_A", "ours_B", "ours_C"],
+                        help="执行后端预设: paper_A (论文式流式 baseline) | "
+                             "ours_B (逐 action TOPP) | ours_C (整段 TOPPRA). "
+                             "不给则用 FullConfig 默认 (whole_chunk + knob).")
+    parser.add_argument("--reward_mode", type=str, default=None,
+                        choices=["knob", "time"], help="覆盖预设的 reward_mode")
     parser.add_argument("--task_name", type=str, default=None)
     parser.add_argument("--task_config", type=str, default=None)
     parser.add_argument("--server_host", type=str, default=None)
@@ -184,7 +197,7 @@ def main():
                              "(replay buffer is NOT saved, will refill).")
     args = parser.parse_args()
 
-    cfg = FullConfig()
+    cfg = FullConfig.preset(args.mode) if args.mode else FullConfig()
     cfg = _override_config(cfg, args)
 
     _set_seed(cfg.train.seed)
@@ -239,21 +252,20 @@ def main():
     )
 
     grids = cfg.action_grid
-    K_tuple = (len(grids.v_grid), len(grids.vel_grid), len(grids.acc_grid))
+    active = grids.active_grids()
+    dim_names = grids.dim_names()
+    K_tuple = tuple(len(g) for g in active)
     print(
-        f"[train] action grid sizes: v={K_tuple[0]} vs={K_tuple[1]} as={K_tuple[2]} "
-        f"(total Q-logits = {sum(K_tuple)})",
+        f"[train] exec_backend={cfg.env.exec_backend} reward_mode={cfg.reward.reward_mode} "
+        f"action_mode={grids.action_mode} dims={dim_names} grid_sizes={K_tuple} "
+        f"(total Q-logits = {sum(K_tuple)}) state_dim={env.state_dim}",
         flush=True,
     )
 
     agent = RainbowAgent(
-        state_dim=cfg.env.state_dim,
+        state_dim=env.state_dim,
         num_actions_per_dim=K_tuple,
-        action_grids=(
-            np.asarray(grids.v_grid, dtype=np.float32),
-            np.asarray(grids.vel_grid, dtype=np.float32),
-            np.asarray(grids.acc_grid, dtype=np.float32),
-        ),
+        action_grids=tuple(np.asarray(g, dtype=np.float32) for g in active),
         c51_cfg=cfg.c51,
         rainbow_cfg=cfg.rainbow,
         net_cfg=cfg.network,
@@ -292,7 +304,7 @@ def main():
                 dtype=np.int64,
             )
             action = np.array(
-                [agent.action_grids[i][idx[i]] for i in range(3)],
+                [agent.action_grids[i][idx[i]] for i in range(len(K_tuple))],
                 dtype=np.float32,
             )
         else:
@@ -335,12 +347,12 @@ def main():
                 #   training/prioritized_replay_beta           - PER importance-sampling β
                 wandb_train = {
                     "training/total_distributional_loss": train_metrics["loss_total"],
-                    "training/critic_loss_dimension_v": train_metrics["loss_dim0"],
-                    "training/critic_loss_dimension_vel_scale": train_metrics["loss_dim1"],
-                    "training/critic_loss_dimension_acc_scale": train_metrics["loss_dim2"],
                     "training/epsilon_greedy_probability": agent.epsilon(step),
                     "training/prioritized_replay_beta": beta,
                 }
+                for _i, _name in enumerate(dim_names):
+                    wandb_train[f"training/critic_loss_dimension_{_name}"] = \
+                        train_metrics[f"loss_dim{_i}"]
                 if wandb_enabled and wandb is not None:
                     wandb.log(wandb_train, step=step)
                 if writer is not None:

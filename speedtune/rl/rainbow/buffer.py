@@ -77,7 +77,8 @@ class PERNStepBuffer:
     multi-step target reward and "next state n steps later".
     """
 
-    # action stored per dim: i_v (int8), i_vs (int8), i_as (int8)
+    # action stored per dim: 离散动作索引, 维数 = num_action_dims
+    #   scalar_v (后端 A) -> 1; v_vel_acc (后端 B/C) -> 3
     def __init__(
         self,
         state_dim: int,
@@ -85,6 +86,7 @@ class PERNStepBuffer:
         n_step: int,
         gamma: float,
         alpha: float,
+        num_action_dims: int = 3,
         eps: float = 1e-6,
         device: str = "cuda",
     ):
@@ -94,9 +96,10 @@ class PERNStepBuffer:
         self.alpha = alpha
         self.eps = eps
         self.device = device
+        self.num_action_dims = int(num_action_dims)
 
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
-        self.actions = np.zeros((capacity, 3), dtype=np.int64)
+        self.actions = np.zeros((capacity, self.num_action_dims), dtype=np.int64)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros((capacity, 1), dtype=np.float32)
@@ -125,7 +128,8 @@ class PERNStepBuffer:
     def add(self, s, a, r, ns, d):
         """Add one env transition; n-step fold happens automatically.
 
-        ``a`` must be a length-3 iterable of int discrete-action indices.
+        ``a`` must be a length-``num_action_dims`` iterable of int
+        discrete-action indices (1 for scalar_v, 3 for v_vel_acc).
         """
         self._buf.append((s, np.asarray(a, dtype=np.int64), float(r), ns, bool(d)))
 

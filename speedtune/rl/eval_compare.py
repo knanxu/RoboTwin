@@ -45,6 +45,7 @@ from .config import (
 def _to_sac_action_space(cfg: RainbowFullConfig) -> _SACActionSpaceConfig:
     g = cfg.action_grid
     return _SACActionSpaceConfig(
+        action_mode=g.action_mode,
         v_low=float(g.v_grid[0]), v_high=float(g.v_grid[-1]),
         vel_low=float(g.vel_grid[0]), vel_high=float(g.vel_grid[-1]),
         acc_low=float(g.acc_grid[0]), acc_high=float(g.acc_grid[-1]),
@@ -54,9 +55,12 @@ def _to_sac_action_space(cfg: RainbowFullConfig) -> _SACActionSpaceConfig:
 def _to_sac_reward(cfg: RainbowFullConfig) -> _SACRewardConfig:
     r = cfg.reward
     return _SACRewardConfig(
+        reward_mode=r.reward_mode,
         alpha_v=r.alpha_v, alpha_vs=r.alpha_vs, alpha_as=r.alpha_as,
         beta_v=r.beta_v, beta_vs=r.beta_vs, beta_as=r.beta_as,
         fallback_penalty=r.fallback_penalty, crash_penalty=r.crash_penalty,
+        alpha_time=r.alpha_time, fallback_seconds=r.fallback_seconds,
+        crash_seconds=r.crash_seconds,
     )
 
 
@@ -66,6 +70,7 @@ def _to_sac_env(cfg: RainbowFullConfig) -> _SACEnvConfig:
         task_name=e.task_name, task_config=e.task_config,
         instruction_type=e.instruction_type,
         chunk_size=e.chunk_size, max_chunks_per_episode=e.max_chunks_per_episode,
+        exec_backend=e.exec_backend, stream_hold_steps=e.stream_hold_steps,
         cond_emb_dim=e.cond_emb_dim, state_dim=e.state_dim,
     )
 
@@ -327,17 +332,14 @@ def write_compare_video(
 # -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
-def _build_agent(ckpt_path: str, cfg: RainbowFullConfig) -> RainbowAgent:
+def _build_agent(ckpt_path: str, cfg: RainbowFullConfig, env: ChunkSpeedupEnv) -> RainbowAgent:
     grids = cfg.action_grid
-    K_tuple = (len(grids.v_grid), len(grids.vel_grid), len(grids.acc_grid))
+    active = grids.active_grids()
+    K_tuple = tuple(len(g) for g in active)
     agent = RainbowAgent(
-        state_dim=cfg.env.state_dim,
+        state_dim=env.state_dim,
         num_actions_per_dim=K_tuple,
-        action_grids=(
-            np.asarray(grids.v_grid, dtype=np.float32),
-            np.asarray(grids.vel_grid, dtype=np.float32),
-            np.asarray(grids.acc_grid, dtype=np.float32),
-        ),
+        action_grids=tuple(np.asarray(g, dtype=np.float32) for g in active),
         c51_cfg=cfg.c51,
         rainbow_cfg=cfg.rainbow,
         net_cfg=cfg.network,
@@ -370,6 +372,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to rainbow_stepN.pt checkpoint.")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["paper_A", "ours_B", "ours_C"],
+                        help="必须与训练该 ckpt 时的预设一致 (决定后端/动作维度/奖励).")
     parser.add_argument("--task_name", type=str, default=None)
     parser.add_argument("--task_config", type=str, default=None)
     parser.add_argument("--server_host", type=str, default=None)
@@ -391,7 +396,7 @@ def main():
                         help="Subdir name. Defaults to compare_<unix_ts>.")
     args = parser.parse_args()
 
-    cfg = RainbowFullConfig()
+    cfg = RainbowFullConfig.preset(args.mode) if args.mode else RainbowFullConfig()
     cfg = _override_cfg(cfg, args)
 
     run_name = args.run_name or f"compare_{int(time.time())}"
@@ -408,7 +413,7 @@ def main():
         device=cfg.train.device,
     )
 
-    agent = _build_agent(args.ckpt, cfg)
+    agent = _build_agent(args.ckpt, cfg, env)
     print(f"[eval] loaded ckpt: {args.ckpt}", flush=True)
 
     seeds = [args.seed_base + i for i in range(args.n_episodes)]
@@ -417,7 +422,8 @@ def main():
         a, _idx = agent.select_action(obs, env_step=10**9, deterministic=True)
         return a
 
-    BASELINE = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    # baseline = scale 1.0 (无加速); 维度对齐 action_mode (A:1 维, B/C:3 维)
+    BASELINE = np.ones(env.action_dim, dtype=np.float32)
 
     def baseline_action(_obs: np.ndarray) -> np.ndarray:
         return BASELINE.copy()
