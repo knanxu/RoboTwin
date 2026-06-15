@@ -573,8 +573,17 @@ class Base_Task(gym.Env):
         self.left_joint_path = args.get("left_joint_path", [])
         self.right_joint_path = args.get("right_joint_path", [])
 
-    def _set_eval_video_ffmpeg(self, ffmpeg):
+    def _set_eval_video_ffmpeg(self, ffmpeg, fps: float = 10.0,
+                               phys_hz: int = 250, video_save_freq: int = 25):
         self.eval_video_ffmpeg = ffmpeg
+        # 视频回放帧率 (帧/秒) = 物理频率 / video_save_freq, 否则视频快慢 != 实机.
+        self.eval_video_fps = float(fps)
+        self.eval_video_phys_hz = int(phys_hz)
+        self.eval_video_save_freq = int(video_save_freq)
+        # 持久物理步累加器: 跨 chunk / take_action / hold_and_render 连续计数, 保证
+        # 视频总帧数 = 整个 episode 总物理步 / video_save_freq, 即回放严格实时.
+        # 每 episode 起新 ffmpeg 时归零 (此方法在 eval 主循环里每 episode 调用一次).
+        self._video_phys_acc = 0
 
     def close_env(self, clear_cache=False):
         if clear_cache:
@@ -588,6 +597,71 @@ class Base_Task(gym.Env):
             self.eval_video_ffmpeg.stdin.close()
             self.eval_video_ffmpeg.wait()
             del self.eval_video_ffmpeg
+
+    def _write_eval_video_frame(self):
+        """实时抓 head_camera 当前画面 (uint8) 写入 eval 视频. video 未开启时 no-op."""
+        if self.eval_video_path is None or not hasattr(self, "eval_video_ffmpeg"):
+            return
+        try:
+            self.cameras.update_picture()
+            rgb = self.cameras.get_rgb()["head_camera"]["rgb"]
+            if rgb.dtype != np.uint8:
+                rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+            self.eval_video_ffmpeg.stdin.write(np.ascontiguousarray(rgb).tobytes())
+        except Exception:
+            pass
+
+    def _tick_eval_video(self, video_save_freq):
+        """每个物理步调用一次: 累计物理步, 每 video_save_freq 步抓 1 张新帧.
+
+        用持久累加器 self._video_phys_acc (跨 take_action / chunk / hold_and_render 连续),
+        保证视频帧数 = 总物理步 / video_save_freq, 回放严格实时. video 未开启或
+        video_save_freq<=0 时为 no-op (后者用于不录制实时帧的原生 take_action 路径).
+        """
+        if (self.eval_video_path is None or not hasattr(self, "eval_video_ffmpeg")
+                or video_save_freq is None or video_save_freq <= 0):
+            return
+        self._video_phys_acc = int(getattr(self, "_video_phys_acc", 0)) + 1
+        if self._video_phys_acc >= int(video_save_freq):
+            self._video_phys_acc = 0
+            self._write_eval_video_frame()
+
+    def hold_and_render(self, duration_s, video_save_freq=None):
+        """推理延迟等"非执行等待": 空跑物理步, 机器人保持当前关节位姿不动.
+
+        按物理频率步进 round(duration_s * phys_hz) 步, 期间机器人锁定当前关节位置 (零速),
+        并正常按 video_save_freq 写帧. 使视频里出现等长的"静止保持"片段, 视频时长 = 实机
+        时长 (sim-to-real). 不消耗 take_action_cnt, 不检查 success. 物理仿真照常推进 (比塞
+        重复帧更真实: 含 PD 保持/物体微沉降). video 未开启或时长<=0 时直接返回, 不空跑.
+        """
+        if self.eval_video_path is None or not hasattr(self, "eval_video_ffmpeg"):
+            return 0
+        if duration_s is None or duration_s <= 0 or self.eval_success:
+            return 0
+        phys_hz = int(getattr(self, "eval_video_phys_hz", 250))
+        vsf = int(video_save_freq if video_save_freq is not None
+                  else getattr(self, "eval_video_save_freq", 25))
+        n_steps = int(round(float(duration_s) * phys_hz))
+        if n_steps <= 0:
+            return 0
+        # 锁定当前双臂关节位置 (零速保持); [:-1] 去掉末位 gripper, 与 take_action 一致.
+        left_q = np.asarray(self.robot.get_left_arm_jointState()[:-1], dtype=np.float64)
+        right_q = np.asarray(self.robot.get_right_arm_jointState()[:-1], dtype=np.float64)
+        left_zero = np.zeros_like(left_q)
+        right_zero = np.zeros_like(right_q)
+        left_g = float(self.robot.get_left_gripper_val())
+        right_g = float(self.robot.get_right_gripper_val())
+        for _ in range(n_steps):
+            self.robot.set_arm_joints(left_q, left_zero, "left")
+            self.robot.set_gripper(left_g, "left")
+            self.robot.set_arm_joints(right_q, right_zero, "right")
+            self.robot.set_gripper(right_g, "right")
+            self.scene.step()
+            self._update_render()
+            if self.render_freq:
+                self.viewer.render()
+            self._tick_eval_video(vsf)
+        return n_steps
 
     def delay(self, delay_time, save_freq=None):
         render_freq = self.render_freq
@@ -1478,7 +1552,8 @@ class Base_Task(gym.Env):
         return True  # TODO: maybe need try error
 
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos',
-                    vel_scale: float = 1.0, acc_scale: float = 1.0):
+                    vel_scale: float = 1.0, acc_scale: float = 1.0,
+                    video_save_freq: int = -1):
         """
         Args:
             action: 单帧动作 (action_dim,)
@@ -1487,12 +1562,21 @@ class Base_Task(gym.Env):
                 1.0 = 保持 mplib 默认约束 (与未加参数前行为等价).
                 >1.0 = 临时放大 TOPP 的 joint_vel_limits / joint_acc_limits,
                 调用结束后自动恢复.
+            video_save_freq: <=0 (默认) = 原行为, 开头写 1 帧 now_obs (依赖调用方每次
+                take_action 后 get_obs 刷新 now_obs, 如各 policy 的逐帧 eval). >0 = 实时
+                模式 (per_action 后端用): 不写可能 stale 的开头帧, 改在控制循环内每
+                video_save_freq 物理步抓 1 张新帧, 与 streaming/whole_chunk 一致.
         """
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return 0
 
+        # 原行为仅在非实时模式 (video_save_freq<=0): 写开头 now_obs 帧. 实时模式靠下面
+        # 控制循环的 _tick_eval_video 抓新帧, 避免 per_action 把一个 chunk 内 M 次调用
+        # 全写同一张陈旧 now_obs (导致视频每 chunk 只有 1 张静止画面).
         eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
+        if (video_save_freq <= 0 and self.eval_video_path is not None
+                and hasattr(self, "eval_video_ffmpeg")
+                and self.take_action_cnt % eval_video_freq == 0):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
@@ -1669,6 +1753,8 @@ class Base_Task(gym.Env):
             self._update_render()
             dense_steps_taken += 1
 
+            self._tick_eval_video(video_save_freq)  # 实时模式下抓新帧 (per_action 后端)
+
             if self.check_success():
                 self.eval_success = True
                 _t_obs = time.perf_counter()
@@ -1831,14 +1917,9 @@ class Base_Task(gym.Env):
         info["take_action_cnt_delta"] = M
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m  (chunk M={M}, T={T})", end="\r")
 
-        # 视频帧: 整段开头写 1 帧, 保持与原 take_action 每次调用写 1 帧的语义
-        if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
-            try:
-                self.eval_video_ffmpeg.stdin.write(
-                    self.now_obs["observation"]["head_camera"]["rgb"].tobytes()
-                )
-            except Exception:
-                pass
+        # 视频帧: 不在 chunk 开头写"header 帧" (对应 0 物理时间, 会让回放偏快). 实时视频
+        # 只由下面循环 _tick_eval_video "每 video_save_freq 物理步 1 帧" 产生; chunk 间的
+        # 推理延迟由 hold_and_render (空跑物理步保持位姿) 在 deploy_policy.eval 里补.
 
         # ---- 内部物理步循环 ----
         # 硬上限防御: 正常 chunk T < 几千, 设 100000 防御病态 TOPP 输出.
@@ -1868,16 +1949,7 @@ class Base_Task(gym.Env):
             self._update_render()
             step_taken += 1
 
-            if (video_save_freq > 0 and step_taken % video_save_freq == 0
-                    and self.eval_video_path is not None and hasattr(self, "eval_video_ffmpeg")):
-                try:
-                    self.cameras.update_picture()
-                    rgb = self.cameras.get_rgb()["head_camera"]["rgb"]
-                    if rgb.dtype != np.uint8:
-                        rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
-                    self.eval_video_ffmpeg.stdin.write(np.ascontiguousarray(rgb).tobytes())
-                except Exception:
-                    pass
+            self._tick_eval_video(video_save_freq)  # 实时新帧, 持久累加器保证回放实时
 
             if self.check_success():
                 self.eval_success = True
@@ -1901,7 +1973,8 @@ class Base_Task(gym.Env):
         return info
 
     def take_chunk_action_per_action(self, action_chunk, vel_scale: float = 1.0,
-                                     acc_scale: float = 1.0, v: float = 1.0):
+                                     acc_scale: float = 1.0, v: float = 1.0,
+                                     video_save_freq: int = -1):
         """后端 B: RoboTwin 原生逐 action 点到点 TOPP 执行 (复用 take_action), 外露 vel/acc.
 
         先按 v 线性插值压缩 chunk, 再把压缩后的每个 action 依次交给 take_action 执行.
@@ -1954,7 +2027,8 @@ class Base_Task(gym.Env):
             if self.take_action_cnt >= self.step_lim or self.eval_success:
                 break
             n = self.take_action(action_chunk[i], action_type="qpos",
-                                 vel_scale=vel_scale, acc_scale=acc_scale)
+                                 vel_scale=vel_scale, acc_scale=acc_scale,
+                                 video_save_freq=video_save_freq)
             dense_steps += int(n or 0)
             executed += 1
             if self.eval_success:
@@ -1970,11 +2044,17 @@ class Base_Task(gym.Env):
         return info
 
     def take_chunk_action_streaming(self, action_chunk, v: float = 1.0,
-                                   hold_steps: int = 5, video_save_freq: int = -1):
+                                   hold_steps: int = 15, video_save_freq: int = -1):
         """后端 A: 论文式固定时长流式执行 (无 TOPP), 忠实 SpeedTuning baseline.
 
         reconstruct(v) → 逐个关节目标按固定频率流式下发, 每个目标 hold `hold_steps`
-        个物理步 (250Hz / hold_steps = 控制频率; hold_steps=5 → 50Hz 模拟论文 ALOHA).
+        个物理步 (250Hz / hold_steps = 等效控制频率).
+
+        ★ hold_steps 必须对齐专家数据采集步长 save_freq (RoboTwin 默认 15 → 250/15≈16.7Hz):
+        采集时每 save_freq 个物理步存一帧 (obs, action), 策略就是在该节奏上训练的, 相邻
+        action 对应 save_freq 个物理步的真实运动. 用 hold_steps=save_freq 回放 = 专家原速;
+        若误用论文 ALOHA 的 50Hz (hold_steps=5) 会快 save_freq/5≈3 倍 (脱离真机). RL 的 v
+        压缩比应在这个真实基线之上再加速.
         位置命令在 [q_i, q_{i+1}] 间按 250Hz 线性插值, 速度前馈 vel_ff=(q_{i+1}-q_i)*rate
         (非零, 连续速度, 防 stop-and-go; 底层 PD 连续追一个移动目标). 不经 TOPP, 不钳
         物理上限 (PD 跟踪能力即隐式约束, 忠实论文的 speed-success 权衡).
@@ -2034,12 +2114,8 @@ class Base_Task(gym.Env):
         info["take_action_cnt_delta"] = M
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m  (stream M={M}, H={H})", end="\r")
 
-        if (self.eval_video_path is not None) and hasattr(self, "eval_video_ffmpeg"):
-            try:
-                self.eval_video_ffmpeg.stdin.write(
-                    self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
-            except Exception:
-                pass
+        # 视频帧: 不写 chunk 开头的 header 帧 (对应 0 物理时间, 会让回放偏快). 实时视频
+        # 只由下面循环 _tick_eval_video 产生; 推理延迟由 hold_and_render 在 eval 里补.
 
         dense_steps = 0
         for i in range(M):
@@ -2067,16 +2143,7 @@ class Base_Task(gym.Env):
                 self._update_render()
                 dense_steps += 1
 
-                if (video_save_freq > 0 and dense_steps % video_save_freq == 0
-                        and self.eval_video_path is not None and hasattr(self, "eval_video_ffmpeg")):
-                    try:
-                        self.cameras.update_picture()
-                        rgb = self.cameras.get_rgb()["head_camera"]["rgb"]
-                        if rgb.dtype != np.uint8:
-                            rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
-                        self.eval_video_ffmpeg.stdin.write(np.ascontiguousarray(rgb).tobytes())
-                    except Exception:
-                        pass
+                self._tick_eval_video(video_save_freq)  # 实时新帧, 持久累加器保证回放实时
 
                 if self.check_success():
                     self.eval_success = True
@@ -2112,16 +2179,20 @@ class Base_Task(gym.Env):
           "whole_chunk" 后端 C (默认): 整段 TOPPRA. 保持原行为.
 
         self.exec_backend / self.stream_hold_steps 由 eval 脚本设到 TASK_ENV 上
-        (缺省 whole_chunk / 5, 故未设置时与改动前行为一致).
+        (缺省 whole_chunk; stream_hold_steps 缺省对齐采集 save_freq=15).
+        video_save_freq 透传给三个后端的实时写帧 (_tick_eval_video).
         """
         backend = getattr(self, "exec_backend", "whole_chunk")
-        hold = int(getattr(self, "stream_hold_steps", 5))
+        # 缺省 hold 对齐采集步长 save_freq (默认 15); 无 save_freq 时退化为 15.
+        hold = int(getattr(self, "stream_hold_steps", None)
+                   or getattr(self, "save_freq", None) or 15)
         if backend == "streaming":
             return self.take_chunk_action_streaming(
                 action_chunk, v=v, hold_steps=hold, video_save_freq=video_save_freq)
         if backend == "per_action":
             return self.take_chunk_action_per_action(
-                action_chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v)
+                action_chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                video_save_freq=video_save_freq)
         return self.take_chunk_action(
             action_chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
             video_save_freq=video_save_freq)

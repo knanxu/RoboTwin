@@ -97,7 +97,7 @@ class ChunkSpeedupEnv:
 
         # 执行后端 & 论文式流式参数
         self.exec_backend = getattr(env_cfg, "exec_backend", "whole_chunk")
-        self.stream_hold_steps = int(getattr(env_cfg, "stream_hold_steps", 5))
+        self.stream_hold_steps = int(getattr(env_cfg, "stream_hold_steps", 15))
 
         # state = cond_emb + last_action(action_dim) + cnt(1) + last_fallback(1)
         self.state_dim = env_cfg.cond_emb_dim + self.action_dim + 2

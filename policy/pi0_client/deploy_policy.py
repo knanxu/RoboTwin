@@ -6,6 +6,7 @@
 """
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -34,7 +35,8 @@ _websocket_client_policy = _import_openpi_client()
 
 class PI0Client:
 
-    def __init__(self, host, port, pi0_step, vel_scale=1.0, acc_scale=1.0, v=1.0, video_save_freq=25):
+    def __init__(self, host, port, pi0_step, vel_scale=1.0, acc_scale=1.0, v=1.0,
+                 video_save_freq=25, infer_latency_ms=None):
         print(f"connecting to policy server at {host}:{port} ...")
         self.client = _websocket_client_policy.WebsocketClientPolicy(host=host, port=int(port))
         self.pi0_step = int(pi0_step)
@@ -42,6 +44,9 @@ class PI0Client:
         self.acc_scale = float(acc_scale)
         self.v = float(v)
         self.video_save_freq = int(video_save_freq)
+        # 推理延迟 (秒): None=用实测 get_action 墙钟 (含网络+服务端计算);
+        # 设为数值 (ms) 则固定该值, 用于对齐目标真机的板载推理时延 (sim-to-real).
+        self.infer_latency_s = (float(infer_latency_ms) / 1000.0) if infer_latency_ms is not None else None
         self.instruction = None
 
     def set_language(self, instruction):
@@ -84,6 +89,7 @@ def get_model(usr_args):
         acc_scale=usr_args.get("acc_scale", 1.0),
         v=usr_args.get("v", 1.0),
         video_save_freq=usr_args.get("video_save_freq", 25),
+        infer_latency_ms=usr_args.get("infer_latency_ms", None),
     )
 
 
@@ -92,7 +98,17 @@ def eval(TASK_ENV, model, observation):
         model.set_language(TASK_ENV.get_instruction())
 
     input_rgb_arr, input_state = encode_obs(observation)
+
+    # ---- 推理 (阻塞) 并计时 ----
+    _t_infer = time.perf_counter()
     actions = model.get_action(input_rgb_arr, input_state)[:model.pi0_step]
+    infer_s = time.perf_counter() - _t_infer
+
+    # 推理延迟计入视频时间轴: 同步部署下真机此间静止等待. 用 hold_and_render 空跑物理步
+    # (机器人保持当前位姿不动), 期间正常写帧, 使视频回放速度 = 实机速度. 比塞重复帧更真实
+    # (物理仿真照常推进). infer_latency_s 不为 None 时用固定值 (对齐目标真机), 否则用实测.
+    idle_s = model.infer_latency_s if model.infer_latency_s is not None else infer_s
+    TASK_ENV.hold_and_render(idle_s)
 
     # 按 TASK_ENV.exec_backend 选择三种执行后端 (streaming/per_action/whole_chunk),
     # 由 eval 脚本设置, 缺省 whole_chunk = 整段 TOPPRA (原行为). 内部按物理步检查

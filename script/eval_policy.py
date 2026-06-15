@@ -157,9 +157,13 @@ def main(usr_args):
     # 选择三种动作执行后端 (设到 TASK_ENV, deploy_policy 的 take_chunk_action_backend 读取).
     # 缺省 whole_chunk = 整段 TOPPRA (原行为不变). B/C 的 vel/acc 默认保持 1.0.
     TASK_ENV.exec_backend = usr_args.get("exec_backend", "whole_chunk")
-    TASK_ENV.stream_hold_steps = int(usr_args.get("stream_hold_steps", 5))
+    # streaming(后端A) 默认对齐专家数据采集步长 save_freq: 每个 action hold save_freq 个
+    # 物理步 = 与采集同频 (250Hz/save_freq≈16.7Hz). 这是策略训练时 action 的真实时间语义;
+    # 不要用论文 ALOHA 的 50Hz(hold=5), 那会快 save_freq/5≈3 倍, 脱离真机执行速度.
+    _save_freq = int(args.get("save_freq") or 15)
+    TASK_ENV.stream_hold_steps = int(usr_args.get("stream_hold_steps", _save_freq))
     print(f"\033[96m[exec] backend={TASK_ENV.exec_backend} "
-          f"stream_hold_steps={TASK_ENV.stream_hold_steps}\033[0m")
+          f"stream_hold_steps={TASK_ENV.stream_hold_steps} (data save_freq={_save_freq})\033[0m")
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
@@ -269,6 +273,12 @@ def eval_policy(task_name,
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
+            # 实时帧率 = 物理频率 / video_save_freq. 执行循环每 video_save_freq 个物理步写
+            # 1 帧, 故按此帧率回放 1 秒视频 = 1 秒实机执行 (再叠加推理延迟的补帧, 见 eval).
+            # video_save_freq 以 model 为准 (单一来源), 与执行后端写帧节奏严格一致.
+            vsf = int(getattr(model, "video_save_freq", 25))
+            phys_hz = int(round(1.0 / float(args.get("timestep", 1.0 / 250))))
+            video_fps = phys_hz / max(1, vsf)  # 250/25 = 10
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -282,7 +292,7 @@ def eval_policy(task_name,
                     "-video_size",
                     video_size,
                     "-framerate",
-                    "10",
+                    f"{phys_hz}/{vsf}",  # 精确有理帧率, 回放速度 = 实机执行速度
                     "-i",
                     "-",
                     "-pix_fmt",
@@ -295,7 +305,7 @@ def eval_policy(task_name,
                 ],
                 stdin=subprocess.PIPE,
             )
-            TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
+            TASK_ENV._set_eval_video_ffmpeg(ffmpeg, fps=video_fps, phys_hz=phys_hz, video_save_freq=vsf)
 
         succ = False
         reset_func(model)
@@ -341,7 +351,11 @@ def parse_args_and_config():
                         help="动作执行后端: streaming(论文式A) | per_action(RoboTwin原生B) | "
                              "whole_chunk(整段TOPPRA C, 默认). B/C 的 TOPPRA vel/acc 默认保持 1.0.")
     parser.add_argument("--stream_hold_steps", type=int, default=None,
-                        help="后端 A 每个目标 hold 的物理步数 (250/H=控制频率, 默认 5=50Hz).")
+                        help="后端 A 每个目标 hold 的物理步数 (250/H=控制频率). 缺省=数据 save_freq "
+                             "(默认 15→≈16.7Hz, 对齐专家采集). 不要用论文 50Hz(=5), 会快≈3 倍.")
+    parser.add_argument("--infer_latency_ms", type=float, default=None,
+                        help="推理延迟(ms), 计入 eval 视频时间轴. 缺省=实测 get_action 墙钟; "
+                             "设固定值则对齐目标真机板载推理时延 (sim-to-real).")
     parser.add_argument("--save_dir", type=str, default=None,
                         help="覆盖默认 eval_result 输出目录 (对比脚本用: 把三种后端写到同一对比文件夹下).")
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
@@ -372,6 +386,8 @@ def parse_args_and_config():
         config["exec_backend"] = args.exec_backend
     if args.stream_hold_steps is not None:
         config["stream_hold_steps"] = args.stream_hold_steps
+    if args.infer_latency_ms is not None:
+        config["infer_latency_ms"] = args.infer_latency_ms
     if args.save_dir is not None:
         config["save_dir"] = args.save_dir
 

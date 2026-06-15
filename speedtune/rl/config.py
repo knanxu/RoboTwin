@@ -89,7 +89,7 @@ class EnvConfig:
 
     # exec_backend: "streaming" (A) | "per_action" (B) | "whole_chunk" (C)
     exec_backend: str = "whole_chunk"
-    stream_hold_steps: int = 5              # 后端 A: 每目标 hold 的物理步数 (250/5=50Hz)
+    stream_hold_steps: int = 15             # 后端 A: 每目标 hold 的物理步数, 对齐采集 save_freq=15 (250/15≈16.7Hz)
 
     # 状态维度: cond_emb + last_action(action_dim) + chunk_idx_norm(1) + last_topp_fallback(1)
     # action_dim 由 action_mode 决定 (scalar_v=1, v_vel_acc=3); env 实际计算并校验 state_dim,
