@@ -98,6 +98,9 @@ class ChunkSpeedupEnv:
         # 执行后端 & 论文式流式参数
         self.exec_backend = getattr(env_cfg, "exec_backend", "whole_chunk")
         self.stream_hold_steps = int(getattr(env_cfg, "stream_hold_steps", 15))
+        # k_skip: A/B 每个 env.step 执行的动作数 (论文式 frame skip); C(整段 TOPPRA) 忽略.
+        _ks = getattr(env_cfg, "k_skip", None)
+        self.k_skip = int(_ks) if (_ks and int(_ks) > 0) else None
 
         # state = cond_emb + last_action(action_dim) + cnt(1) + last_fallback(1)
         self.state_dim = env_cfg.cond_emb_dim + self.action_dim + 2
@@ -109,6 +112,7 @@ class ChunkSpeedupEnv:
         self._last_action = np.ones(self.action_dim, dtype=np.float32)
         self._last_fallback = 0.0
         self._latest_cond_emb = None   # 上次 pi0.5 推理 pool 后 (cond_emb_dim,)
+        self._latest_suffix = None     # 上次 pi0.5 的 action-expert suffix_out (action_horizon, expert_width); 备用, 暂不进 state
         self._latest_chunk = None      # 上次推理出的 chunk (T, action_dim)
         self._episode_total_time = 0.0   # 累计 chunk TOPPRA duration (秒, 仿真物理时间)
         self._episode_step_count = 0
@@ -215,8 +219,13 @@ class ChunkSpeedupEnv:
             "prompt": self._instruction,
         }
 
-    def _infer_pi(self) -> Tuple[np.ndarray, np.ndarray]:
-        """返回 (chunk[T, action_dim], cond_emb[D]). 累计 pi0.5 推理墙钟到 episode 计时器."""
+    def _infer_pi(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """返回 (chunk[T, action_dim], cond_emb[D], suffix_out[T, W]). 累计 pi0.5 推理墙钟到 episode 计时器.
+
+        suffix_out = action expert 逐 token 的 hidden ([action_horizon, expert_width]), 与 cond_emb 一同由
+        openpi server 的 infer_with_hidden 返回 (policy.py:154-155). 当前仅缓存到 self._latest_suffix 备用,
+        暂不进 _assemble_state (喂网络是后续工作).
+        """
         obs = self._build_pi_obs()
         _t0 = time.perf_counter()
         out = self._policy_client.infer_with_hidden(obs)
@@ -228,7 +237,8 @@ class ChunkSpeedupEnv:
                 f"cond_emb dim mismatch: got {cond.shape[0]} vs "
                 f"EnvConfig.cond_emb_dim={self.env_cfg.cond_emb_dim}"
             )
-        return actions, cond
+        suffix = np.asarray(out["suffix_out"], dtype=np.float32)
+        return actions, cond, suffix
 
     # ------------------------------------------------------------------
     # state assembly
@@ -281,15 +291,15 @@ class ChunkSpeedupEnv:
             else:
                 t = float(chunk_info.get("dense_steps", 0)) / self._sim_hz
             r_time = -float(rc.alpha_time) * t
-            return r_time + (1.0 if is_success else 0.0), r_time
+            return r_time + (rc.success_bonus if is_success else 0.0), r_time
         # knob mode
         if status == "topp_fallback":
             return float(rc.fallback_penalty), 0.0
         if status == "truncated":
             # 入口截断: chunk 没执行 (dense_steps=0), 给速度奖励是错误归因.
-            return (1.0 if is_success else 0.0), 0.0
+            return (rc.success_bonus if is_success else 0.0), 0.0
         r_v = self._reward_speed(action)
-        return r_v + (1.0 if is_success else 0.0), r_v
+        return r_v + (rc.success_bonus if is_success else 0.0), r_v
 
     def _crash_reward(self) -> float:
         """环境崩溃的 terminal 奖励 (按 reward_mode)."""
@@ -342,9 +352,10 @@ class ChunkSpeedupEnv:
         self._episode_pi_infer_time = 0.0
         self._episode_chunk_exec_time = 0.0
         self._episode_real_exec_time = 0.0
-        chunk, cond = self._infer_pi()
+        chunk, cond, suffix = self._infer_pi()
         self._latest_chunk = chunk
         self._latest_cond_emb = cond
+        self._latest_suffix = suffix
         self._chunk_idx = 0
         self._last_action = np.ones(self.action_dim, dtype=np.float32)
         self._last_fallback = 0.0
@@ -379,13 +390,15 @@ class ChunkSpeedupEnv:
             _t_exec = time.perf_counter()
             if self.exec_backend == "streaming":
                 chunk_info = self._task_env.take_chunk_action_streaming(
-                    chunk, v=v, hold_steps=self.stream_hold_steps
+                    chunk, v=v, hold_steps=self.stream_hold_steps,
+                    max_actions=self.k_skip,
                 )
             elif self.exec_backend == "per_action":
                 chunk_info = self._task_env.take_chunk_action_per_action(
-                    chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
+                    chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                    max_actions=self.k_skip,
                 )
-            else:  # "whole_chunk"
+            else:  # "whole_chunk" (整段 TOPPRA, k_skip 不适用, 整段执行)
                 chunk_info = self._task_env.take_chunk_action(
                     chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v
                 )
@@ -440,7 +453,7 @@ class ChunkSpeedupEnv:
 
         # ---- 推下一段 ----
         try:
-            chunk, cond = self._infer_pi()
+            chunk, cond, suffix = self._infer_pi()
         except Exception as e:
             info["error"] = f"pi05 infer failed: {e!r}"
             self._finalize_wall_time()
@@ -453,6 +466,7 @@ class ChunkSpeedupEnv:
             )
         self._latest_chunk = chunk
         self._latest_cond_emb = cond
+        self._latest_suffix = suffix
         self._chunk_idx += 1
 
         return self._assemble_state(cond), reward, False, False, info

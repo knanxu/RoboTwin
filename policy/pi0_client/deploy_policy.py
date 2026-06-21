@@ -44,9 +44,12 @@ class PI0Client:
         self.acc_scale = float(acc_scale)
         self.v = float(v)
         self.video_save_freq = int(video_save_freq)
-        # 推理延迟 (秒): None=用实测 get_action 墙钟 (含网络+服务端计算);
-        # 设为数值 (ms) 则固定该值, 用于对齐目标真机的板载推理时延 (sim-to-real).
+        # 推理延迟口径优先级 (用于视频里的推理停顿时长): 固定覆盖 > 服务端纯前向 > 墙钟回退.
+        # infer_latency_s: None=不固定; 设数值(ms)则固定该值, 对齐目标真机板载推理时延.
         self.infer_latency_s = (float(infer_latency_ms) / 1000.0) if infer_latency_ms is not None else None
+        # last_infer_ms: 每次 get_action 后存服务端回传的纯模型前向耗时 (ms, 排除 websocket
+        # 网络/序列化); server 不回传 server_timing 时为 None, eval 回退到实测墙钟.
+        self.last_infer_ms = None
         self.instruction = None
 
     def set_language(self, instruction):
@@ -64,7 +67,11 @@ class PI0Client:
             },
             "prompt": self.instruction,
         }
-        return np.asarray(self.client.infer(obs)["actions"])
+        result = self.client.infer(obs)
+        # 取服务端纯模型前向耗时 (排除网络); 老 server 不回传时记 None (eval 回退墙钟).
+        timing = result.get("server_timing", {}) if isinstance(result, dict) else {}
+        self.last_infer_ms = timing.get("infer_ms", None)
+        return np.asarray(result["actions"])
 
     def reset(self):
         self.instruction = None
@@ -99,15 +106,20 @@ def eval(TASK_ENV, model, observation):
 
     input_rgb_arr, input_state = encode_obs(observation)
 
-    # ---- 推理 (阻塞) 并计时 ----
+    # ---- 推理 (阻塞), 实测墙钟仅作回退 ----
     _t_infer = time.perf_counter()
     actions = model.get_action(input_rgb_arr, input_state)[:model.pi0_step]
-    infer_s = time.perf_counter() - _t_infer
+    wall_s = time.perf_counter() - _t_infer
 
     # 推理延迟计入视频时间轴: 同步部署下真机此间静止等待. 用 hold_and_render 空跑物理步
-    # (机器人保持当前位姿不动), 期间正常写帧, 使视频回放速度 = 实机速度. 比塞重复帧更真实
-    # (物理仿真照常推进). infer_latency_s 不为 None 时用固定值 (对齐目标真机), 否则用实测.
-    idle_s = model.infer_latency_s if model.infer_latency_s is not None else infer_s
+    # (机器人保持当前位姿不动), 期间正常写帧, 使视频回放速度 = 实机速度.
+    # 口径优先级: 固定覆盖(--infer_latency_ms) > 服务端纯前向 infer_ms(排除网络) > 墙钟回退.
+    if model.infer_latency_s is not None:
+        idle_s = model.infer_latency_s
+    elif model.last_infer_ms is not None:
+        idle_s = float(model.last_infer_ms) / 1000.0
+    else:
+        idle_s = wall_s
     TASK_ENV.hold_and_render(idle_s)
 
     # 按 TASK_ENV.exec_backend 选择三种执行后端 (streaming/per_action/whole_chunk),

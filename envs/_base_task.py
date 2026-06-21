@@ -34,6 +34,14 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
 
+def _apply_k_skip(action_chunk, max_actions):
+    """k_skip (论文式 frame skip): 只保留重构后 chunk 的前 max_actions 个动作 (上层执行完即
+    重推 pi0.5, 闭环重决策); max_actions=None/<=0 → 不截断 (整段执行). 见 SpeedTuning Alg.1."""
+    if max_actions is not None and max_actions > 0 and action_chunk.shape[0] > max_actions:
+        return action_chunk[:max_actions]
+    return action_chunk
+
+
 class Base_Task(gym.Env):
 
     def __init__(self):
@@ -1974,7 +1982,7 @@ class Base_Task(gym.Env):
 
     def take_chunk_action_per_action(self, action_chunk, vel_scale: float = 1.0,
                                      acc_scale: float = 1.0, v: float = 1.0,
-                                     video_save_freq: int = -1):
+                                     video_save_freq: int = -1, max_actions: int = None):
         """后端 B: RoboTwin 原生逐 action 点到点 TOPP 执行 (复用 take_action), 外露 vel/acc.
 
         先按 v 线性插值压缩 chunk, 再把压缩后的每个 action 依次交给 take_action 执行.
@@ -2019,6 +2027,8 @@ class Base_Task(gym.Env):
                 info["status"] = "truncated"
                 return info
 
+        action_chunk = _apply_k_skip(action_chunk, max_actions)
+
         M = int(action_chunk.shape[0])
         dense_steps = 0
         executed = 0
@@ -2044,7 +2054,8 @@ class Base_Task(gym.Env):
         return info
 
     def take_chunk_action_streaming(self, action_chunk, v: float = 1.0,
-                                   hold_steps: int = 15, video_save_freq: int = -1):
+                                   hold_steps: int = 15, video_save_freq: int = -1,
+                                   max_actions: int = None):
         """后端 A: 论文式固定时长流式执行 (无 TOPP), 忠实 SpeedTuning baseline.
 
         reconstruct(v) → 逐个关节目标按固定频率流式下发, 每个目标 hold `hold_steps`
@@ -2094,6 +2105,8 @@ class Base_Task(gym.Env):
             if action_chunk.shape[0] == 0:
                 info["status"] = "truncated"
                 return info
+
+        action_chunk = _apply_k_skip(action_chunk, max_actions)
 
         M = int(action_chunk.shape[0])
 

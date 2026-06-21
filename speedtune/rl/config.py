@@ -32,12 +32,14 @@ PHYS_ACC_CEIL: float = 3.0   # rad/s^2
 class ActionSpaceConfig:
     # action_mode: "scalar_v" (后端 A, 论文式, 动作只有 v)
     #            | "v_vel_acc" (后端 B/C, 三参数 v/vel_scale/acc_scale)
+    # 注意: Rainbow 路径下这些连续上下界由 ActionGridConfig 网格端点自动派生
+    # (rainbow/train.py:_to_sac_action_space), 此处默认值仅作 SAC 路径 / 文档参考.
     action_mode: str = "v_vel_acc"
 
-    v_low: float = 0.8
-    v_high: float = 1.5
-    # vel/acc_scale 上界对应 base(1.0) × scale ≤ 物理天花板(3.0), 故上界 ≤ 3.0.
-    # (原 vel_high=2.0 / acc_high=4.0; acc=4.0 已超物理上限, 下调到 3.0)
+    # v = chunk 压缩比率 ∈ [1, 4] (1=原速, 4=4× 加速). 与 rainbow ActionGridConfig 一致.
+    v_low: float = 1.0
+    v_high: float = 4.0
+    # vel/acc_scale ∈ [1, 物理天花板 3.0]: base(1.0) × scale ≤ PHYS_*_CEIL.
     vel_low: float = 1.0
     vel_high: float = 3.0
     acc_low: float = 1.0
@@ -61,21 +63,32 @@ class RewardConfig:
       vel/acc_scale 通过 dense_steps 自动"融合"进来 (省时间才得分, 饱和即止).
       fallback/crash 按一段"慢 chunk"计时, 防 agent 故意触发以逃避时间惩罚.
     """
-    reward_mode: str = "knob"
+    # 三 preset 统一默认 time; knob 仅 paper_A 论文复现消融 (--reward_mode knob).
+    reward_mode: str = "time"
 
-    # --- knob mode ---
-    alpha_v: float = 0.05
-    alpha_vs: float = 0.05
-    alpha_as: float = 0.05
-    beta_v: float = 2.0
+    # 成功奖励 (两模式共用, 一次性 terminal, 统一 15). 必须远大于"加速可省/可刷的奖励",
+    # 否则 agent 会牺牲成功换速度.
+    success_bonus: float = 15.0
+
+    # --- knob mode (论文式 α·v^β; 仅消融) ---
+    # ⚠️ alpha_v 必须极小: RoboTwin 失败 episode 跑到 step_lim 预算耗尽 (~80 步), 每步领
+    #    α·v^β, 失败-高速可累积 80·α·v_max^β. 成功优先要求 α_v < success_bonus/(80·v_max^β)
+    #    = 15/(80·16) ≈ 0.0117, 故取 0.005 (失败-v4≈6.4 < 成功≈15.6). 速度信号因此偏弱,
+    #    要更强加速请用 time 模式.
+    alpha_v: float = 0.005
+    alpha_vs: float = 0.005
+    alpha_as: float = 0.005
+    beta_v: float = 2.0              # 论文 ablation 最优 (β=2)
     beta_vs: float = 2.0
     beta_as: float = 1.0
     fallback_penalty: float = 0.0    # knob: fallback 不给负 penalty
     crash_penalty: float = 0.0       # knob: crash 不给负 penalty (仅 terminal)
 
-    # --- time mode ---
-    alpha_time: float = 0.3          # 时间惩罚系数 (Pareto 旋钮)
-    fallback_seconds: float = 4.0    # time: fallback 计为这么多秒 (≥ 最慢正常 chunk)
+    # --- time mode (真实时间惩罚, 抗 hack) ---
+    # 成功优先由构造保证: success_bonus(15) > alpha_time·T_max(≈0.2·48≈9.6). alpha_time 仍是
+    # Pareto 旋钮 (调大→更激进加速但成功率风险↑). 0.2 给强速度信号且留足成功 margin.
+    alpha_time: float = 0.2
+    fallback_seconds: float = 4.0    # time: fallback 计为这么多秒 (≥ 最慢正常 chunk, 防故意触发)
     crash_seconds: float = 8.0       # time: crash 计为这么多秒
 
 
@@ -90,6 +103,10 @@ class EnvConfig:
     # exec_backend: "streaming" (A) | "per_action" (B) | "whole_chunk" (C)
     exec_backend: str = "whole_chunk"
     stream_hold_steps: int = 15             # 后端 A: 每目标 hold 的物理步数, 对齐采集 save_freq=15 (250/15≈16.7Hz)
+    # k_skip (论文式 frame skip): A/B 下每个 env.step 只执行重构 chunk 的前 k_skip 个动作,
+    # 执行完即重推 pi0.5 (闭环), 速度策略每 k_skip 动作重决策一次. C(整段 TOPPRA) 忽略此项.
+    # 论文取 10; 缩短 MDP horizon、突出 terminal 奖励. None/<=0 = 执行整段.
+    k_skip: int = 10
 
     # 状态维度: cond_emb + last_action(action_dim) + chunk_idx_norm(1) + last_topp_fallback(1)
     # action_dim 由 action_mode 决定 (scalar_v=1, v_vel_acc=3); env 实际计算并校验 state_dim,

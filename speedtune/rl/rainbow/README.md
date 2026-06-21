@@ -27,37 +27,41 @@ Rainbow 全 6 组件中实装的：
 
 ## 离散网格（默认）
 
+由 `GRID_STEP`（默认 0.25）统一粒度构造，vel/acc 上界引用物理天花板 `PHYS_*_CEIL`：
+
 | 维度 | 取值 | 档数 |
 |---|---|---|
-| v | 0.8, 0.9, …, 1.5 (step 0.1) | 8 |
-| vel_scale | 1.0, 1.2, …, 2.0 (step 0.2) | 6 |
-| acc_scale | 1.0, 1.5, …, 4.0 (step 0.5) | 7 |
+| v (chunk 压缩比率) | 1.0, 1.25, …, 4.0 (step 0.25) | 13 |
+| vel_scale | 1.0, 1.25, …, 3.0 (step 0.25) | 9 |
+| acc_scale | 1.0, 1.25, …, 3.0 (step 0.25) | 9 |
 
-Factored Q heads → 共 **21 个 Q logits**（每个 logits 是 n_atoms=101 维分布）。
+Factored Q heads → 共 **31 个 Q logits**（每个 logits 是 n_atoms=101 维分布）；
+`scalar_v`（paper_A）下只有 v，**|V|=13**。
 
-如果你想缩窄/拓宽边界，改 `speedtune/rl/rainbow/config.py:ActionGridConfig`。
+改粒度只动 `config.py:GRID_STEP` 一个值；改范围/上界改 `ActionGridConfig`。
 
-## C51 支持
+## Reward 两范式（三 preset 统一默认 time）
 
-| 参数 | 默认 | 备注 |
-|---|---|---|
-| V_min | 0.0 | 方案 A 下 reward ≥ 0 |
-| V_max | 8.0 | 实际 episode return 上界 ~5-7 |
-| n_atoms | 101 | 分辨率约 0.08 reward/atom（很精细） |
-| n_step | 3 | Rainbow 标准 |
+详见 `rl/config.py` 顶部说明 + `rl/env.py:_compute_reward`。每个 env.step 算一次：
 
-**Reward 设计（方案 A，非负）**：
-- 正常 chunk: `r = r_v + r_task ∈ [0.13, 1.51]`，其中 r_v 单步 ~0.2-0.5
-- TOPP fallback: `r = 0`（不给负 penalty，靠 episode 预算消耗自然惩罚）
-- crash: `r = 0` 且 done=True（崩溃是工程异常，不参与 reward 信号）
+- **time（默认, 抗 hack, 推荐）**：`r = -α_time·(dense_steps/250) + success_bonus·1{success}`
+  - α_time=0.2, success_bonus=15；fallback 按 `fallback_seconds=4` 计时、crash 按 `crash_seconds=8`。
+  - 奖励实际省下的时间，唯一高分路径 = 又快又成功；失败只累积负时间 → 抗 hack。
+- **knob（论文式 α·v^β, 仅 paper_A 论文复现消融: `--reward_mode knob`）**：
+  `r = α_v·v^β_v (+α_vs·vel^β_vs+α_as·acc^β_as) + success_bonus·1{success}`
+  - α_v=0.005（须极小, 否则失败 episode 跑满预算每步刷速度奖励）, β_v=2；fallback/crash penalty=0。
 
-**Episode return 估算**：
-- 成功 episode 通常 10-30 chunk，只有末尾给 r_task=1
-- 平均每 chunk r_v ≈ 0.3，总 r_v ≈ 3-9，加 r_task=1
-- 实际折扣 return ≈ 5-7
-- V_max=8 留 ~15% 余量，避免 projector clip 极端值
+## C51 支持（区间随 reward_mode 自动派生）
 
-如果你的 reward 设置变了（比如改大 α），记得拓宽 V_max。
+`c51_bounds_for(reward_mode)` 在 preset 和 train.py 中调用；`--reward_mode knob` 时自动切区间，
+无需手动 `--v_min/--v_max`（显式给则优先）：
+
+| reward_mode | V_min | V_max | n_atoms | 回报范围估计 |
+|---|---|---|---|---|
+| time (默认) | -20.0 | 16.0 | 101 | 快成功 ~+14, 慢失败 ~-9.6 (病态 fallback 更负→钳) |
+| knob (消融) | 0.0 | 16.0 | 101 | 非负, 成功 ~+15.6 |
+
+改大 α / success_bonus 时, 相应调整 `c51_bounds_for` 的区间。
 
 ## 启动训练
 

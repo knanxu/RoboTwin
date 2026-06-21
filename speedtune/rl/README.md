@@ -6,7 +6,7 @@ pi0.5 推理出的 chunk 条件下, 选什么 `(v, vel_scale, acc_scale)` 三元
 `rl/rainbow/config.py`, 共享的 env/奖励/动作空间配置见 `rl/config.py`.)
 
 - 动作: `(v, vel_scale, acc_scale)` 离散网格 (Rainbow 用离散动作), 边界
-  `v∈[0.8,1.5]`, `vel∈[1.0,2.0]`, `acc∈[1.0,4.0]` (可在 `rl/rainbow/config.py` 改)
+  `v∈[1,4]`, `vel∈[1,3]`, `acc∈[1,3]` (step 0.25; 改 `rl/rainbow/config.py:GRID_STEP` 调粒度)
 - 状态: pi0.5 action expert 的 mean-pooled prefix features (2048D) +
   上一步动作 (3D) + cnt 进度 (1D) + 上一步是否 topp fallback (1D) = 2053D
 - Reward (Plan A 非负奖励):

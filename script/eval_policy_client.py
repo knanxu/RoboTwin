@@ -519,8 +519,8 @@ def parse_args_and_config():
                         help="后端 A 每个目标 hold 的物理步数 (250/H=控制频率). 缺省=数据 save_freq "
                              "(默认 15→≈16.7Hz, 对齐专家采集). 不要用论文 50Hz(=5), 会快≈3 倍.")
     parser.add_argument("--infer_latency_ms", type=float, default=None,
-                        help="推理延迟(ms), 计入 eval 视频时间轴. 缺省=实测 get_action 墙钟; "
-                             "设固定值则对齐目标真机板载推理时延 (sim-to-real).")
+                        help="推理延迟(ms), 计入 eval 视频时间轴. 缺省=服务端纯前向 infer_ms"
+                             "(排除网络, 无则回退实测墙钟); 设固定值则对齐目标真机板载时延.")
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
