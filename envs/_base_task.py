@@ -1982,16 +1982,25 @@ class Base_Task(gym.Env):
 
     def take_chunk_action_per_action(self, action_chunk, vel_scale: float = 1.0,
                                      acc_scale: float = 1.0, v: float = 1.0,
-                                     video_save_freq: int = -1, max_actions: int = None):
-        """后端 B: RoboTwin 原生逐 action 点到点 TOPP 执行 (复用 take_action), 外露 vel/acc.
+                                     video_save_freq: int = -1, max_actions: int = None,
+                                     v_cruise: float = None):
+        """后端 B: 逐 action 两点 TOPPRA + 段间非零边界速度 (方法 B), 消除 stop-and-go.
 
-        先按 v 线性插值压缩 chunk, 再把压缩后的每个 action 依次交给 take_action 执行.
-        每个 action 是 [current → target] 两点 TOPP, 首尾零速 = stop-and-go (保持
-        RoboTwin 原生行为). vel_scale/acc_scale 经 take_action 的 scaled_limits 放大
-        mplib base(1.0) 约束; 物理上限由动作格点上界 ≤ 3.0 保证.
-
-        返回与 take_chunk_action 统一的 info dict.
+        与原 (复用 take_action 的两点零速) 的差异:
+          - 每个 action 绕过 mplib, 自调 retime_chunk(单 target) 并传非零 sd_start/sd_end,
+            段间速度幅值不归零 (真加速); 速度方向在段间仍突变 (两点直线几何必然), 靠 PD 兜底.
+          - current 用实测 qpos/qvel (闭环纠累积误差); sd_start = 实测速度切向投影,
+            sd_end = v_cruise (末段 0), 钳到 per-joint vel 约束可行上限.
+          - duration 累加真实 TOPP 时长 (非 dense_steps/250, 消除伪快统计).
+          - 保留逐 action 粒度: 每 action 后查 success / 可中断 (partial chunk / async).
+        retime_chunk 默认 (0,0) 不变, whole_chunk 不受影响.
         """
+        from .robot.toppra_chunk_executor import (
+            retime_chunk, compute_segment_sd_bounds, DEFAULT_CRUISE_SD,
+        )
+        if v_cruise is None:
+            v_cruise = DEFAULT_CRUISE_SD
+
         info = {
             "status": "success",
             "fallback_reason": None,
@@ -2028,26 +2037,133 @@ class Base_Task(gym.Env):
                 return info
 
         action_chunk = _apply_k_skip(action_chunk, max_actions)
-
         M = int(action_chunk.shape[0])
+
+        # ---- 拆臂维度 (用命令值拿 dim, 与既有一致) + 拼 12dof chunk / gripper ----
+        left_jointstate = self.robot.get_left_arm_jointState()
+        right_jointstate = self.robot.get_right_arm_jointState()
+        left_arm_dim = len(left_jointstate) - 1
+        right_arm_dim = len(right_jointstate) - 1
+        left_arm_actions = action_chunk[:, :left_arm_dim]
+        left_gripper_actions = action_chunk[:, left_arm_dim]
+        right_arm_actions = action_chunk[:, left_arm_dim + 1: left_arm_dim + 1 + right_arm_dim]
+        right_gripper_actions = action_chunk[:, left_arm_dim + 1 + right_arm_dim]
+        chunk_arm = np.concatenate([left_arm_actions, right_arm_actions], axis=1)        # (M, 12)
+        chunk_gripper = np.stack([left_gripper_actions, right_gripper_actions], axis=1)  # (M, 2)
+
+        # ---- 12 dof base vel/acc limits ----
+        left_p = self.robot.left_mplib_planner.planner
+        right_p = self.robot.right_mplib_planner.planner
+        joint_vel_limits = np.concatenate([
+            np.asarray(left_p.joint_vel_limits, dtype=np.float64),
+            np.asarray(right_p.joint_vel_limits, dtype=np.float64),
+        ])
+        joint_acc_limits = np.concatenate([
+            np.asarray(left_p.joint_acc_limits, dtype=np.float64),
+            np.asarray(right_p.joint_acc_limits, dtype=np.float64),
+        ])
+
         dense_steps = 0
         executed = 0
+        total_duration = 0.0
         _t_obs0 = float(getattr(self, "_last_success_obs_time", 0.0))
+
         for i in range(M):
             if self.take_action_cnt >= self.step_lim or self.eval_success:
                 break
-            n = self.take_action(action_chunk[i], action_type="qpos",
-                                 vel_scale=vel_scale, acc_scale=acc_scale,
-                                 video_save_freq=video_save_freq)
-            dense_steps += int(n or 0)
+
+            # --- 实测 current (闭环): 位置 + 速度 (去掉 gripper, 仅 arm dof) ---
+            cur_left = self.robot.get_left_arm_real_jointState()[:left_arm_dim]
+            cur_right = self.robot.get_right_arm_real_jointState()[:right_arm_dim]
+            q_current = np.asarray(list(cur_left) + list(cur_right), dtype=np.float64)   # (12,)
+            qd_left = self.robot.get_left_arm_real_jointVelocity()
+            qd_right = self.robot.get_right_arm_real_jointVelocity()
+            qd_actual = np.asarray(list(qd_left) + list(qd_right), dtype=np.float64)     # (12,)
+
+            target = np.asarray(chunk_arm[i], dtype=np.float64)                          # (12,)
+            sd_start, sd_end, tangent, seg_len = compute_segment_sd_bounds(
+                q_current, qd_actual, target, joint_vel_limits, vel_scale,
+                is_last=(i == M - 1), v_cruise=v_cruise,
+            )
+
+            # 退化段 (current≈target): 不 TOPP, 仅推进 cnt
+            if tangent is None:
+                self.take_action_cnt += 1
+                executed += 1
+                continue
+
+            current_gripper = np.array([
+                self.robot.get_left_gripper_val(), self.robot.get_right_gripper_val(),
+            ]).reshape(-1)
+
+            result = retime_chunk(
+                current_state_arm=q_current,
+                chunk_arm=target[None, :],                  # (1, 12) → 内部 vstack 成两点
+                current_gripper=current_gripper,
+                chunk_gripper=chunk_gripper[i][None, :],     # (1, 2)
+                joint_vel_limits=joint_vel_limits,
+                joint_acc_limits=joint_acc_limits,
+                vel_scale=vel_scale, acc_scale=acc_scale, exec_hz=250,
+                sd_start=sd_start, sd_end=sd_end,
+            )
+
+            # TOPP 失败 → 该段回退原 mplib take_action (stop-and-go), 保证不崩
+            if result["status"] != "success":
+                n = self.take_action(action_chunk[i], action_type="qpos",
+                                     vel_scale=vel_scale, acc_scale=acc_scale,
+                                     video_save_freq=video_save_freq)
+                dense_steps += int(n or 0)   # take_action 内部已 cnt += 1
+                executed += 1
+                if self.eval_success:
+                    break
+                continue
+
+            # --- 下发 dense 轨迹 (复刻 take_chunk_action 下发循环) ---
+            dense_arm = result["dense_arm_pos"]        # (T, 12)
+            dense_arm_vel = result["dense_arm_vel"]    # (T, 12)
+            dense_gripper = result["dense_gripper"]    # (T, 2)
+            total_duration += float(result["duration"])
+            info["topp_return_code"] = result["return_code"]
+            T = dense_arm.shape[0]
+            T_cap = min(T, 100000)
+            seg_success = False
+            for t in range(T_cap):
+                self._update_render()
+                if self.render_freq:
+                    self.viewer.render()
+                self.robot.set_arm_joints(
+                    dense_arm[t, :left_arm_dim], dense_arm_vel[t, :left_arm_dim], "left")
+                self.robot.set_gripper(float(dense_gripper[t, 0]), "left")
+                self.robot.set_arm_joints(
+                    dense_arm[t, left_arm_dim:left_arm_dim + right_arm_dim],
+                    dense_arm_vel[t, left_arm_dim:left_arm_dim + right_arm_dim], "right")
+                self.robot.set_gripper(float(dense_gripper[t, 1]), "right")
+                self.scene.step()
+                self._update_render()
+                dense_steps += 1
+                self._tick_eval_video(video_save_freq)
+                if self.check_success():
+                    self.eval_success = True
+                    _t = time.perf_counter()
+                    self.get_obs()
+                    if self.eval_video_path is not None and hasattr(self, "eval_video_ffmpeg"):
+                        try:
+                            self.eval_video_ffmpeg.stdin.write(
+                                self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                        except Exception:
+                            pass
+                    self._last_success_obs_time = time.perf_counter() - _t
+                    seg_success = True
+                    break
+
+            self.take_action_cnt += 1
             executed += 1
-            if self.eval_success:
+            if seg_success or self.eval_success:
                 break
 
         info["dense_steps"] = dense_steps
-        info["duration"] = dense_steps / 250.0
+        info["duration"] = total_duration   # 真实 TOPP 时长累加 (口径修正, 不再 dense_steps/250)
         info["take_action_cnt_delta"] = executed
-        # take_action 在 success 分支里更新了 self._last_success_obs_time; 取增量
         info["success_obs_time"] = max(
             0.0, float(getattr(self, "_last_success_obs_time", 0.0)) - _t_obs0
         )
