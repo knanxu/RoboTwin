@@ -523,6 +523,22 @@ class Robot:
         jointState_list.append(self.get_right_gripper_val())
         return jointState_list
 
+    def get_left_arm_real_jointVelocity(self) -> list:
+        velocity_list = []
+        left_joints_qvel = self.left_entity.get_qvel()
+        left_active_joints = self.left_entity.get_active_joints()
+        for joint in self.left_arm_joints:
+            velocity_list.append(float(left_joints_qvel[left_active_joints.index(joint)]))
+        return velocity_list
+
+    def get_right_arm_real_jointVelocity(self) -> list:
+        velocity_list = []
+        right_joints_qvel = self.right_entity.get_qvel()
+        right_active_joints = self.right_entity.get_active_joints()
+        for joint in self.right_arm_joints:
+            velocity_list.append(float(right_joints_qvel[right_active_joints.index(joint)]))
+        return velocity_list
+
     def get_left_gripper_val(self):
         if None in self.left_gripper:
             print("No gripper")
