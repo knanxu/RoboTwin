@@ -25,6 +25,10 @@ import toppra.algorithm as algo
 PHYS_VEL_CEIL: float = 3.0   # rad/s
 PHYS_ACC_CEIL: float = 3.0   # rad/s^2
 
+# 方法 B (per_action 逐 action 非零边界) 的默认巡航路径速度 (= 12dof 联合关节速度幅值, rad/s).
+# 保守初值, 云端按 "时间↓ / success 不降 / jerk 可接受" 实测调.
+DEFAULT_CRUISE_SD: float = 1.0
+
 
 def retime_chunk(
     current_state_arm: np.ndarray,
@@ -38,6 +42,8 @@ def retime_chunk(
     exec_hz: int = 250,
     phys_vel_ceil: float = PHYS_VEL_CEIL,
     phys_acc_ceil: float = PHYS_ACC_CEIL,
+    sd_start: float = 0.0,
+    sd_end: float = 0.0,
 ):
     """
     对整段 chunk 做一次 TOPPRA, 返回密集采样的目标位置 / 速度 / gripper / 时长.
@@ -136,7 +142,7 @@ def retime_chunk(
             gridpoints=gridpoints,
             parametrizer="ParametrizeConstAccel",
         )
-        retimed = instance.compute_trajectory(0, 0)
+        retimed = instance.compute_trajectory(sd_start, sd_end)
     except Exception as exc:
         return fail(f"toppra solve exception: {exc}")
 
@@ -230,3 +236,43 @@ def _sample_path_position(retimed, sample_times: np.ndarray) -> np.ndarray:
         return np.full_like(sample_times, s_min, dtype=float)
     frac = (sample_times - t0) / (t1 - t0)
     return s_min + frac * (s_max - s_min)
+
+
+def compute_segment_sd_bounds(
+    q_current: np.ndarray,
+    qd_actual: np.ndarray,
+    target: np.ndarray,
+    joint_vel_limits: np.ndarray,
+    vel_scale: float,
+    is_last: bool,
+    v_cruise: float,
+    phys_vel_ceil: float = PHYS_VEL_CEIL,
+    safety: float = 0.9,
+):
+    """方法 B: 算逐 action 两点段在弧长参数化下的边界路径速度 (sd_start, sd_end).
+
+    弧长参数化下 |dq/ds|=1, 故 sd = 关节空间速度幅值 (rad/s).
+      - sd_start = 实测关节速度在本段单位切向上的投影 (闭环), clip >= 0.
+      - sd_end   = 末段 0; 否则 min(v_cruise, safety * sd_max),
+                   sd_max = min_j(scaled_vel_j / |tangent_j|) 由 per-joint vel 约束推.
+    Returns: (sd_start, sd_end, tangent, seg_len). seg_len<1e-6 表退化 (tangent=None).
+    """
+    q_current = np.asarray(q_current, dtype=np.float64)
+    qd_actual = np.asarray(qd_actual, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    seg = target - q_current
+    seg_len = float(np.linalg.norm(seg))
+    if seg_len < 1e-6:
+        return 0.0, 0.0, None, seg_len
+    tangent = seg / seg_len
+    sd_start = max(0.0, float(qd_actual @ tangent))
+    if is_last:
+        sd_end = 0.0
+    else:
+        scaled_vel = np.minimum(
+            np.asarray(joint_vel_limits, dtype=np.float64) * float(vel_scale),
+            float(phys_vel_ceil),
+        )
+        sd_max = float(np.min(scaled_vel / np.maximum(np.abs(tangent), 1e-9)))
+        sd_end = min(float(v_cruise), float(safety) * sd_max)
+    return sd_start, sd_end, tangent, seg_len
