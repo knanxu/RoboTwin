@@ -43,6 +43,7 @@ try:
             active_joints_name,
             all_joints,
             yml_path=None,
+            time_dilation_factor=None,
         ):
             super().__init__()
             ta.setup_logging("CRITICAL")  # hide logging
@@ -55,6 +56,10 @@ try:
             self.robot_origion_pose = robot_origion_pose
             self.active_joints_name = active_joints_name
             self.all_joints = all_joints
+            # 专家轨迹减速因子: <1.0 时对规划轨迹做时间上采样 (见 _slow_down_traj),
+            # 使逐点执行变慢, 不动 max_vel/max_acc 等物理上限. None/>=1.0=原速.
+            # 例 0.2 -> 轨迹点数 x5 -> 慢 5 倍.
+            self.time_dilation_factor = time_dilation_factor
 
             # translate from baselink to arm's base
             with open(self.yml_path, "r") as f:
@@ -157,9 +162,37 @@ try:
                 return res_result
             else:
                 res_result["status"] = "Success"
-                res_result["position"] = np.array(result.interpolated_plan.position.to("cpu"))
-                res_result["velocity"] = np.array(result.interpolated_plan.velocity.to("cpu"))
+                pos = np.array(result.interpolated_plan.position.to("cpu"))
+                vel = np.array(result.interpolated_plan.velocity.to("cpu"))
+                res_result["position"], res_result["velocity"] = self._slow_down_traj(pos, vel)
                 return res_result
+
+        def _slow_down_traj(self, position, velocity):
+            """
+            按 time_dilation_factor (<1.0) 对规划轨迹做时间上采样, 使其在 RoboTwin
+            "逐点 250Hz 执行"下变慢: 物理时长 ∝ 轨迹点数 N, 故把 N 点线性插值到
+            round(N / factor) 点 (factor=0.2 -> 5x 点 -> 慢 5 倍), 速度同步 * factor.
+            不改 max_vel/max_acc 等物理上限, 仅增密轨迹采样.
+            注: curobo 原生 time_dilation_factor 只缩放速度/时间元数据、不增点数,
+            对本执行方式无效, 故改为在此后处理重采样.
+            """
+            f = self.time_dilation_factor
+            if f is None or f >= 1.0 or position is None or position.shape[0] < 2:
+                return position, velocity
+            n = position.shape[0]
+            n_new = max(2, int(round(n / f)))
+            old_t = np.linspace(0.0, 1.0, n)
+            new_t = np.linspace(0.0, 1.0, n_new)
+            pos_new = np.empty((n_new, position.shape[1]), dtype=position.dtype)
+            for j in range(position.shape[1]):
+                pos_new[:, j] = np.interp(new_t, old_t, position[:, j])
+            if velocity is not None and velocity.shape[0] == n:
+                vel_new = np.empty((n_new, velocity.shape[1]), dtype=velocity.dtype)
+                for j in range(velocity.shape[1]):
+                    vel_new[:, j] = np.interp(new_t, old_t, velocity[:, j]) * f
+            else:
+                vel_new = velocity
+            return pos_new, vel_new
 
         def plan_batch(
             self,
@@ -253,7 +286,12 @@ try:
             return res_result
 
         def plan_grippers(self, now_val, target_val):
+            # 夹爪开合步数同样随 time_dilation_factor 放大, 与手臂轨迹一致减速,
+            # 使整段动作严格按 1/factor 倍变慢 (否则固定 200 步会稀释整体比率).
             num_step = 200
+            f = self.time_dilation_factor
+            if f is not None and f < 1.0:
+                num_step = max(2, int(round(num_step / f)))
             dis_val = target_val - now_val
             step = dis_val / num_step
             res = {}

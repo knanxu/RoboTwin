@@ -155,6 +155,12 @@ class Base_Task(gym.Env):
                 except:
                     print(f"{self.task_name} not in step limit file, set to 1000")
                     self.step_lim = 1000
+            # 慢速专家 eval 时按需放大步数上限, 避免慢动作被中途截断 (仅 eval 生效;
+            # 数据生成阶段 play_once 不受 step_lim 限制). 来自 task_config 的
+            # eval_step_lim_scale (缺省 1.0), 经验取值 ~ 1/expert_speed_factor.
+            _scale = kwags.get("eval_step_lim_scale", 1.0)
+            if _scale and float(_scale) != 1.0:
+                self.step_lim = int(self.step_lim * float(_scale))
 
         # info
         self.info = dict()

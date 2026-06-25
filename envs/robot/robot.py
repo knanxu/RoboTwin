@@ -37,6 +37,19 @@ class Robot:
 
         self.need_topp = need_topp
 
+        # 专家轨迹速度: task_config 的 expert_speed_factor (速度倍率, <1.0 变慢,
+        # 1.0/缺省=原速). 作为减速因子透传给 CuroboPlanner, 由 _slow_down_traj 对
+        # 规划轨迹做时间上采样 (增密点数), 不改 max_vel/max_acc 等物理上限.
+        _esf = kwargs.get("expert_speed_factor", None)
+        self.expert_time_dilation = (float(_esf) if (_esf is not None and float(_esf) < 1.0) else None)
+        # reset 复用已有 robot 时 (load_robot else 分支) planner 不会重建, 把最新
+        # 减速因子同步到现有 CuroboPlanner: _slow_down_traj 为后处理, 改属性即时
+        # 生效, 无需重新 warmup. 首次创建时 planner 尚不存在, 由 set_planner 透传.
+        for _pname in ("left_planner", "right_planner"):
+            _p = getattr(self, _pname, None)
+            if isinstance(_p, CuroboPlanner):
+                _p.time_dilation_factor = self.expert_time_dilation
+
         self.left_urdf_path = os.path.join(left_robot_file, left_embodiment_args["urdf_path"])
         self.left_srdf_path = left_embodiment_args.get("srdf_path", None)
         self.left_curobo_yml_path = os.path.join(left_robot_file, "curobo.yml")
@@ -268,11 +281,13 @@ class Robot:
             self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
                                               self.left_arm_joints_name,
                                               [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                                              yml_path=abs_left_curobo_yml_path)
+                                              yml_path=abs_left_curobo_yml_path,
+                                              time_dilation_factor=self.expert_time_dilation)
             self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
                                                self.right_arm_joints_name,
                                                [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                                               yml_path=abs_right_curobo_yml_path)
+                                               yml_path=abs_right_curobo_yml_path,
+                                               time_dilation_factor=self.expert_time_dilation)
         else:
             self.left_conn, left_child_conn = mp.Pipe()
             self.right_conn, right_child_conn = mp.Pipe()
@@ -281,14 +296,16 @@ class Robot:
                 "origin_pose": self.left_entity_origion_pose,
                 "joints_name": self.left_arm_joints_name,
                 "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                "yml_path": abs_left_curobo_yml_path
+                "yml_path": abs_left_curobo_yml_path,
+                "time_dilation_factor": self.expert_time_dilation
             }
 
             right_args = {
                 "origin_pose": self.right_entity_origion_pose,
                 "joints_name": self.right_arm_joints_name,
                 "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                "yml_path": abs_right_curobo_yml_path
+                "yml_path": abs_right_curobo_yml_path,
+                "time_dilation_factor": self.expert_time_dilation
             }
 
             self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
@@ -679,7 +696,8 @@ def planner_process_worker(conn, args):
     import os
     from .planner import CuroboPlanner  # 或者绝对路径导入
 
-    planner = CuroboPlanner(args["origin_pose"], args["joints_name"], args["all_joints"], yml_path=args["yml_path"])
+    planner = CuroboPlanner(args["origin_pose"], args["joints_name"], args["all_joints"], yml_path=args["yml_path"],
+                            time_dilation_factor=args.get("time_dilation_factor", None))
 
     while True:
         try:
