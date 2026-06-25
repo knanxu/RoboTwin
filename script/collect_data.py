@@ -36,7 +36,7 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(task_name=None, task_config=None):
+def main(task_name=None, task_config=None, expert_speed_factor=None):
 
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
@@ -45,6 +45,10 @@ def main(task_name=None, task_config=None):
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     args['task_name'] = task_name
+    # 命令行 expert_speed_factor 覆盖 task_config 同名值 (命令行 > yml > 缺省). <1.0
+    # 变慢, 由 robot.py 透传 CuroboPlanner._slow_down_traj 对专家轨迹时间上采样减速.
+    if expert_speed_factor is not None:
+        args["expert_speed_factor"] = expert_speed_factor
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -99,7 +103,12 @@ def main(task_name=None, task_config=None):
 
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
-    args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
+    # 命令行 override 速度时, 数据目录加 _esf<值> 后缀, 避免和 task_config 原配置
+    # (或其它速度档) 的数据混/覆盖; 未走命令行 override 时与原来逐字节一致.
+    save_setting = str(args["task_config"])
+    if expert_speed_factor is not None:
+        save_setting = f"{save_setting}_esf{expert_speed_factor}"
+    args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), save_setting)
     run(task, args)
 
 
@@ -229,7 +238,9 @@ def run(TASK_ENV, args):
             TASK_ENV.remove_data_cache()
             assert TASK_ENV.check_success(), "Collect Error"
 
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
+        # 用实际数据目录名 (含可能的 _esf 后缀) 而非 task_config, 保证 instruction
+        # 定位的 scene_info 路径 (task_name/setting) 与数据落盘目录一致.
+        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {os.path.basename(args['save_path'])} {args['language_num']}"
         os.system(command)
 
 
@@ -243,8 +254,11 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
+    parser.add_argument("--expert_speed_factor", "--esf", type=float, default=None,
+                        help="<1.0 变慢, 覆盖 task_config 的同名值; 不传则用 yml")
     parser = parser.parse_args()
     task_name = parser.task_name
     task_config = parser.task_config
 
-    main(task_name=task_name, task_config=task_config)
+    main(task_name=task_name, task_config=task_config,
+         expert_speed_factor=parser.expert_speed_factor)
