@@ -39,16 +39,30 @@ def get_embodiment_config(robot_file):
 def main(task_name=None, task_config=None, expert_speed_factor=None):
 
     task = class_decorator(task_name)
+    # 命令行 esf: 生成/复用一个带 esf 的【真实】task_config yml, 使 RoboTwin 的 setting 概念自洽。
+    # setting 同时是 task_config yml 名 + 数据目录名 + instruction setting —— gen_episode_instructions
+    # 会用 setting 读 task_config/<setting>.yml (见其 line 264); 只给数据目录加后缀会让 instruction
+    # 生成找不到 yml 而崩。故 esf 时落一个真实的 <task_config>_esf<esf>.yml, 之后整条流程都用它做 setting。
+    if expert_speed_factor is not None:
+        eff_config = f"{task_config}_esf{expert_speed_factor}"
+        eff_yml = f"./task_config/{eff_config}.yml"
+        if not os.path.exists(eff_yml):
+            with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
+                _cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+            _cfg["expert_speed_factor"] = float(expert_speed_factor)
+            with open(eff_yml, "w", encoding="utf-8") as f:
+                yaml.dump(_cfg, f, allow_unicode=True, sort_keys=False)
+        task_config = eff_config
+
     config_path = f"./task_config/{task_config}.yml"
 
     with open(config_path, "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     args['task_name'] = task_name
-    # 命令行 expert_speed_factor 覆盖 task_config 同名值 (命令行 > yml > 缺省). <1.0
-    # 变慢, 由 robot.py 透传 CuroboPlanner._slow_down_traj 对专家轨迹时间上采样减速.
+    # 双保险: eff_yml 已含 expert_speed_factor, 此处再强制一致 (防 eff_yml 被手改).
     if expert_speed_factor is not None:
-        args["expert_speed_factor"] = expert_speed_factor
+        args["expert_speed_factor"] = float(expert_speed_factor)
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -103,12 +117,9 @@ def main(task_name=None, task_config=None, expert_speed_factor=None):
 
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
-    # 命令行 override 速度时, 数据目录加 _esf<值> 后缀, 避免和 task_config 原配置
-    # (或其它速度档) 的数据混/覆盖; 未走命令行 override 时与原来逐字节一致.
-    save_setting = str(args["task_config"])
-    if expert_speed_factor is not None:
-        save_setting = f"{save_setting}_esf{expert_speed_factor}"
-    args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), save_setting)
+    # task_config 在 esf 时已是 <config>_esf<esf> (上方已落真实 yml), 故 save_path 与 instruction
+    # 自然带该后缀且与 yml 名一致; 不传 esf 时与原版逐字节一致.
+    args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
     run(task, args)
 
 
@@ -238,9 +249,9 @@ def run(TASK_ENV, args):
             TASK_ENV.remove_data_cache()
             assert TASK_ENV.check_success(), "Collect Error"
 
-        # 用实际数据目录名 (含可能的 _esf 后缀) 而非 task_config, 保证 instruction
-        # 定位的 scene_info 路径 (task_name/setting) 与数据落盘目录一致.
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {os.path.basename(args['save_path'])} {args['language_num']}"
+        # setting = args['task_config'] (esf 时已是 <config>_esf<esf>, 有同名真实 yml),
+        # gen_episode_instructions 用它读 task_config/<setting>.yml + 定位 scene_info, 三者一致.
+        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
         os.system(command)
 
 
