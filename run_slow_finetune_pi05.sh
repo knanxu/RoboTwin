@@ -36,11 +36,14 @@ SAVE_INTERVAL=1000                # 每多少步存一次 (中途崩溃可 --res
 KEEP_PERIOD=$NUM_STEPS            # ≥NUM_STEPS → 关闭周期保留; 配合 openpi 硬编码 max_to_keep=1 → 最终只留 19999 一个
                                   # 想"全程只存这 1 次"(省 I/O, 但崩溃要重来): 把 SAVE_INTERVAL 也设成 =NUM_STEPS
 
-# 阶段开关 (1=执行, 0=跳过; 便于断点重跑)
-DO_COLLECT=1
-DO_PROCESS=1
-DO_CONVERT=1
-DO_TRAIN=1
+# 阶段开关 (1=执行, 0=跳过; 便于断点续跑)。支持【环境变量覆盖】, 无需改文件:
+#   只重跑训练:        DO_COLLECT=0 DO_PROCESS=0 DO_CONVERT=0 bash run_slow_finetune_pi05.sh
+#   从 convert 起跑:   DO_COLLECT=0 DO_PROCESS=0 bash run_slow_finetune_pi05.sh
+#   从 process 起跑:   DO_COLLECT=0 bash run_slow_finetune_pi05.sh
+DO_COLLECT=${DO_COLLECT:-1}
+DO_PROCESS=${DO_PROCESS:-1}
+DO_CONVERT=${DO_CONVERT:-1}
+DO_TRAIN=${DO_TRAIN:-1}
 # =====================================================================
 
 SETTING="${TASK_CONFIG}_esf${ESF}"          # 与 collect_data.py 的 save_path 后缀一致
