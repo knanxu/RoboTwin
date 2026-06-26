@@ -25,7 +25,10 @@ OPENPI_ROOT=/home/chenlu/openpi
 TASKS=(place_phone_stand stack_blocks_two place_empty_cup)
 TASK_CONFIG=demo_clean            # 采集基础配置 (无域随机化; 要域随机化改 demo_randomized)
 ESF=0.25                          # 速度倍率 <1.0 变慢 (0.25 ≈ 慢 4 倍)
-GPU=0                             # 单 GPU 串行; 多卡可分多次跑不同 TASKS/GPU
+GPU=0                             # 采集/转换用 (阶段1-3, 单卡够)
+TRAIN_GPUS=0,1,2,3                # 训练用 (阶段4); 列出所有要用的卡
+FSDP_DEVICES=4                    # 模型分片到几张卡 (FSDP 省显存)。openpi 默认=1 只复制不分片→单卡必 OOM。
+                                  # 约束: 卡数 % FSDP_DEVICES==0, 且 batch_size(drift默认32) % 卡数==0 (32%4=0 ✓)
 EXP_NAME=drifting_slow025         # 训练 exp 名 (ckpt 输出子目录名)
 TRAIN_CFG_PREFIX=pi05_aloha_robotwin_drifting   # drift config 前缀 (在 openpi)
 NUM_STEPS=20000                   # 训练步数 (覆盖 config 默认 30000); 最后 ckpt 在 step NUM_STEPS-1 = 19999
@@ -112,9 +115,11 @@ if [ "$DO_TRAIN" = 1 ]; then
     # num_train_steps=20000 → 最后 ckpt 在 step 19999 (train.py:272 末步强制存)
     # keep_period≥steps + openpi 硬编码 max_to_keep=1 → 最终只留 19999 一个
     # norm_stats 复用 trossen(pi05_base) 不重算; 从 pi05_base 权重微调
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 CUDA_VISIBLE_DEVICES="$GPU" \
+    echo "  训练用 GPU=$TRAIN_GPUS  fsdp_devices=$FSDP_DEVICES (FSDP 分片省显存)"
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
       uv run scripts/train.py "${TRAIN_CFG_PREFIX}_$t" --exp-name="$EXP_NAME" --overwrite \
         --num-train-steps="$NUM_STEPS" --save-interval="$SAVE_INTERVAL" --keep-period="$KEEP_PERIOD" \
+        --fsdp-devices="$FSDP_DEVICES" \
       || { echo "WARN: 训练 $t 失败"; FAILED+=("train:$t"); }
   done
 fi
