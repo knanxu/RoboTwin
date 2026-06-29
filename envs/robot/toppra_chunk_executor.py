@@ -19,15 +19,12 @@ import toppra.constraint as cst
 import toppra.algorithm as algo
 
 
-# 物理天花板 (ARX5 / aloha-agilex). vel_scale/acc_scale 放大 base 约束后, 不允许
-# 超过这两个值: acc=3.0 来自 curobo_left.yml:86 (权威), vel=3.0 为工程估计.
-# 主防线是动作格点上界 (config.PHYS_*_CEIL), 这里是执行层 backstop.
-PHYS_VEL_CEIL: float = 3.0   # rad/s
-PHYS_ACC_CEIL: float = 3.0   # rad/s^2
-
-# 方法 B (per_action 逐 action 非零边界) 的默认巡航路径速度 (= 12dof 联合关节速度幅值, rad/s).
-# 保守初值, 云端按 "时间↓ / success 不降 / jerk 可接受" 实测调.
-DEFAULT_CRUISE_SD: float = 1.0
+# 物理天花板 (ARX5 / aloha-agilex), 执行层 backstop. 绝对值制下 vel_limit/acc_limit
+# 直接作关节上限, 钳到这两个值不允许超过. vel=5.0 取真机实测 5~5.5; acc=10.0 为占位
+# 安全网, Task 6 (calibrate_acc_grid) 标定 q̈_max 峰值后回填, 须 >= acc grid 上界.
+PHYS_VEL_CEIL: float = 5.0   # rad/s
+PHYS_ACC_CEIL: float = 10.0  # rad/s^2
+# 绝对值制: DEFAULT_CRUISE_SD 删除 (段间速度由 vel_limit 决定, 不再有独立巡航钳).
 
 
 def retime_chunk(
@@ -35,10 +32,8 @@ def retime_chunk(
     chunk_arm: np.ndarray,
     current_gripper: np.ndarray,
     chunk_gripper: np.ndarray,
-    joint_vel_limits: np.ndarray,
-    joint_acc_limits: np.ndarray,
-    vel_scale: float = 1.0,
-    acc_scale: float = 1.0,
+    vel_limit: float,
+    acc_limit: float,
     exec_hz: int = 250,
     phys_vel_ceil: float = PHYS_VEL_CEIL,
     phys_acc_ceil: float = PHYS_ACC_CEIL,
@@ -53,9 +48,8 @@ def retime_chunk(
         chunk_arm:          (N, dof_arm) 目标路径航点 (不含当前点)
         current_gripper:    (dof_gripper,)  当前夹爪值, dof_gripper 通常 = 2
         chunk_gripper:      (N, dof_gripper) 目标夹爪序列
-        joint_vel_limits:   (dof_arm,)   基础速度上限 (将被 vel_scale 放大)
-        joint_acc_limits:   (dof_arm,)   基础加速度上限 (将被 acc_scale 放大)
-        vel_scale, acc_scale: RL 控制的加速倍率, 1.0 = 基础约束
+        vel_limit:          float, 绝对关节速度上限 (rad/s, 标量广播到各 dof, 钳 phys_vel_ceil)
+        acc_limit:          float, 绝对关节加速度上限 (rad/s^2, 同上)
         exec_hz: 采样频率 (对齐 scene.set_timestep, RoboTwin 为 250)
 
     Returns:
@@ -119,15 +113,10 @@ def retime_chunk(
         path_s,
     )
 
-    # 5. TOPPRA 求解 (应用 scale, 再钳到物理天花板, 保证不超物理限制)
-    vel_lim = np.asarray(joint_vel_limits, dtype=np.float64) * float(vel_scale)
-    acc_lim = np.asarray(joint_acc_limits, dtype=np.float64) * float(acc_scale)
-    vel_lim = np.minimum(vel_lim, float(phys_vel_ceil))
-    acc_lim = np.minimum(acc_lim, float(phys_acc_ceil))
-    if vel_lim.shape[0] != kept_arm.shape[1] or acc_lim.shape[0] != kept_arm.shape[1]:
-        return fail(
-            f"limits dof mismatch: vel={vel_lim.shape} acc={acc_lim.shape} path_dof={kept_arm.shape[1]}"
-        )
+    # 5. TOPPRA 约束 (绝对值制: vel_limit/acc_limit 直接作上限, 标量广播到 dof, 钳物理天花板安全网)
+    dof = kept_arm.shape[1]
+    vel_lim = np.full(dof, min(float(vel_limit), float(phys_vel_ceil)), dtype=np.float64)
+    acc_lim = np.full(dof, min(float(acc_limit), float(phys_acc_ceil)), dtype=np.float64)
 
     try:
         geom = toppra.SplineInterpolator(path_s, kept_arm, bc_type="natural")
@@ -242,37 +231,43 @@ def compute_segment_sd_bounds(
     q_current: np.ndarray,
     qd_actual: np.ndarray,
     target: np.ndarray,
-    joint_vel_limits: np.ndarray,
-    vel_scale: float,
-    is_last: bool,
-    v_cruise: float,
+    vel_limit: float,
+    acc_limit: float,
     phys_vel_ceil: float = PHYS_VEL_CEIL,
-    safety: float = 0.9,
+    phys_acc_ceil: float = PHYS_ACC_CEIL,
+    safety: float = 0.99,
+    sd_start_in: float = None,
 ):
-    """方法 B: 算逐 action 两点段在弧长参数化下的边界路径速度 (sd_start, sd_end).
+    """逐 action 两点段在弧长参数化下的边界路径速度 (sd_start, sd_end).
 
-    弧长参数化下 |dq/ds|=1, 故 sd = 关节空间速度幅值 (rad/s).
-      - sd_start = 实测关节速度在本段单位切向上的投影 (闭环), clip >= 0.
-      - sd_end   = 末段 0; 否则 min(v_cruise, safety * sd_max),
-                   sd_max = min_j(scaled_vel_j / |tangent_j|) 由 per-joint vel 约束推.
+    绝对值制 + 去隐藏约束 + 可控性钳:
+      - sd_start: sd_start_in 给定(开环前馈, 用上段 sd_end)则用之; 否则 = 实测 qd_actual 在本段
+                  单位切向投影(闭环). clip >= 0. (真机软 PD 下闭环实测会逐段滞后累积 → seg/T
+                  暴增, 故 per_action 段内用开环前馈; 见 diag_per_action.py.)
+      - sd_end   = safety * min(sd_max, sd_reachable) (**不再有 is_last 归零、不再有 v_cruise 钳**):
+          sd_max       = vel_limit / max|tangent|              (速度上限)
+          sd_reachable = sqrt(sd_start^2 + 2*acc_path*seg_len)  (段内从 sd_start 加速可达,
+                         acc_path = acc_limit / max|tangent|). 必须钳到 sd_reachable, 否则短段
+                         sd_end 过大 -> 两点 TOPPRA FailUncontrollable -> 回退 take_action
+                         退化为 stop-and-go (且 vel_limit 失效).
     Returns: (sd_start, sd_end, tangent, seg_len). seg_len<1e-6 表退化 (tangent=None).
     """
     q_current = np.asarray(q_current, dtype=np.float64)
-    qd_actual = np.asarray(qd_actual, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     seg = target - q_current
     seg_len = float(np.linalg.norm(seg))
     if seg_len < 1e-6:
         return 0.0, 0.0, None, seg_len
     tangent = seg / seg_len
-    sd_start = max(0.0, float(qd_actual @ tangent))
-    if is_last:
-        sd_end = 0.0
+    if sd_start_in is not None:
+        sd_start = max(0.0, float(sd_start_in))                                        # 开环前馈
     else:
-        scaled_vel = np.minimum(
-            np.asarray(joint_vel_limits, dtype=np.float64) * float(vel_scale),
-            float(phys_vel_ceil),
-        )
-        sd_max = float(np.min(scaled_vel / np.maximum(np.abs(tangent), 1e-9)))
-        sd_end = min(float(v_cruise), float(safety) * sd_max)
+        sd_start = max(0.0, float(np.asarray(qd_actual, dtype=np.float64) @ tangent))  # 闭环实测投影
+    mt = float(np.max(np.abs(tangent)))
+    sd_max = min(float(vel_limit), float(phys_vel_ceil)) / mt
+    sd_start = min(sd_start, float(safety) * sd_max)   # 钳起速到段可行上限: 开环继承上段速度,
+    #            方向变时该路径速度可能超本段 sd_max → 否则 TOPPRA 起速违速度约束 FailUncontrollable
+    acc_path = min(float(acc_limit), float(phys_acc_ceil)) / mt
+    sd_reachable = float(np.sqrt(sd_start ** 2 + 2.0 * acc_path * seg_len))
+    sd_end = float(safety) * min(sd_max, sd_reachable)
     return sd_start, sd_end, tangent, seg_len

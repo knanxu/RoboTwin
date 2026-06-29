@@ -127,8 +127,8 @@ def eval(TASK_ENV, model, observation):
     # check_success 并消耗 take_action_cnt 预算. B/C 的 vel/acc 缺省为 1.0.
     TASK_ENV.take_chunk_action_backend(
         actions,
-        vel_scale=model.vel_scale,
-        acc_scale=model.acc_scale,
+        vel_limit=model.vel_scale,   # 绝对值制: aloha base=1.0 故倍率值=绝对 rad/s, 数值等价(gate-4 行为不变)
+        acc_limit=model.acc_scale,
         v=model.v,
         video_save_freq=model.video_save_freq,
     )
