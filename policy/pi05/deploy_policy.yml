@@ -4,7 +4,7 @@ task_name: null
 task_config: null
 ckpt_setting: null
 seed: null
-instruction_type: unseen
+instruction_type: seen   # 与 pi05 微调(process_data.py desc_type=seen)+SpeedTune rollout 对齐; 原 unseen 对该 ckpt 是 OOD
 
 # Add Parameters You Need
 train_config_name: null
