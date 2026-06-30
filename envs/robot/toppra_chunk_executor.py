@@ -19,12 +19,10 @@ import toppra.constraint as cst
 import toppra.algorithm as algo
 
 
-# 物理天花板 (ARX5 / aloha-agilex), 执行层 backstop. 绝对值制下 vel_limit/acc_limit
-# 直接作关节上限, 钳到这两个值不允许超过. vel=5.0 取真机实测 5~5.5; acc=10.0 为占位
-# 安全网, Task 6 (calibrate_acc_grid) 标定 q̈_max 峰值后回填, 须 >= acc grid 上界.
-PHYS_VEL_CEIL: float = 5.0   # rad/s
-PHYS_ACC_CEIL: float = 10.0  # rad/s^2
-# 绝对值制: DEFAULT_CRUISE_SD 删除 (段间速度由 vel_limit 决定, 不再有独立巡航钳).
+# 绝对值制: vel_limit/acc_limit 直接作关节速度/加速度上限 (rad/s, rad/s^2), 标量广播到各 dof。
+# 不在此处钳物理天花板 —— 上限由调用方 (exec_backends grid) 保证在真机物理范围内。
+# (仿真不在物理层 clamp, 约束完全靠 TOPPRA 参考轨迹满足上限; take_action/mplib fallback 路径
+#  另有自己的钳, 见 planner.py。)
 
 
 def retime_chunk(
@@ -35,8 +33,6 @@ def retime_chunk(
     vel_limit: float,
     acc_limit: float,
     exec_hz: int = 250,
-    phys_vel_ceil: float = PHYS_VEL_CEIL,
-    phys_acc_ceil: float = PHYS_ACC_CEIL,
     sd_start: float = 0.0,
     sd_end: float = 0.0,
 ):
@@ -48,7 +44,7 @@ def retime_chunk(
         chunk_arm:          (N, dof_arm) 目标路径航点 (不含当前点)
         current_gripper:    (dof_gripper,)  当前夹爪值, dof_gripper 通常 = 2
         chunk_gripper:      (N, dof_gripper) 目标夹爪序列
-        vel_limit:          float, 绝对关节速度上限 (rad/s, 标量广播到各 dof, 钳 phys_vel_ceil)
+        vel_limit:          float, 绝对关节速度上限 (rad/s, 标量广播到各 dof; 上限由调用方 grid 保证)
         acc_limit:          float, 绝对关节加速度上限 (rad/s^2, 同上)
         exec_hz: 采样频率 (对齐 scene.set_timestep, RoboTwin 为 250)
 
@@ -113,10 +109,11 @@ def retime_chunk(
         path_s,
     )
 
-    # 5. TOPPRA 约束 (绝对值制: vel_limit/acc_limit 直接作上限, 标量广播到 dof, 钳物理天花板安全网)
+    # 5. TOPPRA 约束 (绝对值制: vel_limit/acc_limit 直接作关节上限, 标量广播到 dof;
+    #    上限由调用方 grid 保证在物理范围内, 此处不再钳天花板)
     dof = kept_arm.shape[1]
-    vel_lim = np.full(dof, min(float(vel_limit), float(phys_vel_ceil)), dtype=np.float64)
-    acc_lim = np.full(dof, min(float(acc_limit), float(phys_acc_ceil)), dtype=np.float64)
+    vel_lim = np.full(dof, float(vel_limit), dtype=np.float64)
+    acc_lim = np.full(dof, float(acc_limit), dtype=np.float64)
 
     try:
         geom = toppra.SplineInterpolator(path_s, kept_arm, bc_type="natural")
@@ -233,8 +230,6 @@ def compute_segment_sd_bounds(
     target: np.ndarray,
     vel_limit: float,
     acc_limit: float,
-    phys_vel_ceil: float = PHYS_VEL_CEIL,
-    phys_acc_ceil: float = PHYS_ACC_CEIL,
     safety: float = 0.99,
     sd_start_in: float = None,
 ):
@@ -264,10 +259,10 @@ def compute_segment_sd_bounds(
     else:
         sd_start = max(0.0, float(np.asarray(qd_actual, dtype=np.float64) @ tangent))  # 闭环实测投影
     mt = float(np.max(np.abs(tangent)))
-    sd_max = min(float(vel_limit), float(phys_vel_ceil)) / mt
+    sd_max = float(vel_limit) / mt
     sd_start = min(sd_start, float(safety) * sd_max)   # 钳起速到段可行上限: 开环继承上段速度,
     #            方向变时该路径速度可能超本段 sd_max → 否则 TOPPRA 起速违速度约束 FailUncontrollable
-    acc_path = min(float(acc_limit), float(phys_acc_ceil)) / mt
+    acc_path = float(acc_limit) / mt
     sd_reachable = float(np.sqrt(sd_start ** 2 + 2.0 * acc_path * seg_len))
     sd_end = float(safety) * min(sd_max, sd_reachable)
     return sd_start, sd_end, tangent, seg_len

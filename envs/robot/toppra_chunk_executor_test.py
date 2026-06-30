@@ -1,6 +1,6 @@
 import numpy as np
 from envs.robot.toppra_chunk_executor import (
-    retime_chunk, compute_segment_sd_bounds, PHYS_VEL_CEIL,
+    retime_chunk, compute_segment_sd_bounds,
 )
 
 # --- 12 dof 假数据: 一条非退化两点路径 (绝对值制) ---
@@ -20,12 +20,6 @@ def test_retime_chunk_absolute_limits_no_base():
     r = _dummy_retime(vel_limit=2.0, acc_limit=2.0)
     assert r["status"] == "success"
     assert np.max(np.abs(r["dense_arm_vel"])) <= 2.0 + 1e-3
-
-def test_retime_chunk_clamped_by_phys_ceil():
-    # vel_limit 超 PHYS_VEL_CEIL 时被钳到天花板
-    r = _dummy_retime(vel_limit=999.0, acc_limit=999.0)
-    assert r["status"] == "success"
-    assert np.max(np.abs(r["dense_arm_vel"])) <= PHYS_VEL_CEIL + 1e-3
 
 def test_default_boundary_zero_terminal_speed():
     # 默认 sd_end=0: 末端速度 ≈ 0 (whole_chunk 整段默认行为, 仍支持)
@@ -71,14 +65,6 @@ def test_sd_start_is_velocity_projection_clipped():
     assert abs(s1 - 0.5) < 1e-6
     s2, _, _, _ = compute_segment_sd_bounds(np.zeros(12), -qd_forward, target, vel_limit=3.0, acc_limit=8.0)
     assert s2 == 0.0
-
-def test_sd_end_clamped_by_phys_ceil():
-    # vel_limit 超 PHYS_VEL_CEIL → sd_max 用钳后的 PHYS_VEL_CEIL；长段使 sd_reachable 不主导
-    target = np.zeros(12); target[0] = 2.0   # seg_len=2, mt=1
-    _, sd_end, _, _ = compute_segment_sd_bounds(np.zeros(12), np.zeros(12), target,
-                                                vel_limit=999.0, acc_limit=999.0)
-    # sd_max=min(999,5)/1=5; sd_reachable=sqrt(2*min(999,10)*2)=sqrt(40)=6.32 > 5 → sd_end=0.99*5
-    assert abs(sd_end - 0.99 * PHYS_VEL_CEIL) < 1e-3
 
 def test_degenerate_segment_flagged():
     sd_start, sd_end, tangent, seg_len = compute_segment_sd_bounds(
