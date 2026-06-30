@@ -1785,7 +1785,7 @@ class Base_Task(gym.Env):
 
 
     def take_chunk_action(self, action_chunk, vel_limit: float = 5.0, acc_limit: float = 10.0, v: float = 1.0,
-                          video_save_freq: int = -1):
+                          video_save_freq: int = -1, max_actions: int = None):
         """
         整段 TOPPRA 执行器: 对一整段 action chunk 做一次 TOPPRA 时间重参数化,
         按 250Hz (对齐 scene.timestep) 密集采样后逐点下发.
@@ -1807,6 +1807,9 @@ class Base_Task(gym.Env):
             video_save_freq: >0 时在物理步循环内每隔该步数采一帧写入 eval 视频
                (250Hz / 25 = 10fps, 与 eval 视频标称帧率一致, 回放约等于实时).
                默认 -1 保持原行为: 每次调用只在开头写 1 帧.
+            max_actions: k_skip (论文式 frame skip). >0 且 reconstruct 后帧数超过它时,
+               只保留前 max_actions 帧再做整段 TOPPRA, 执行完即返回 (上层重推 VLA, 闭环).
+               None/<=0 → 不截断, 整段执行 (旧行为, 向后兼容). 与 per_action 的 _apply_k_skip 一致.
 
         Returns:
             info: dict, 执行统计
@@ -1854,6 +1857,11 @@ class Base_Task(gym.Env):
             if action_chunk.shape[0] == 0:
                 info["status"] = "truncated"
                 return info
+
+        # ---- k_skip (论文式 frame skip): 只取前 max_actions 帧再做整段 TOPPRA ----
+        # 与 per_action (_apply_k_skip @ take_chunk_action_per_action) 一致: 在预算截断之后、
+        # 拆臂/TOPPRA 之前截断; max_actions=None/<=0 → 整段执行 (旧行为).
+        action_chunk = _apply_k_skip(action_chunk, max_actions)
 
         # 压缩后 chunk 帧数 M: 代表策略实际下发的 action 数量, 也是本次调用消耗的 cnt 预算
         M = int(action_chunk.shape[0])
