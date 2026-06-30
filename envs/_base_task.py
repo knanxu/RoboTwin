@@ -1863,17 +1863,17 @@ class Base_Task(gym.Env):
         right_jointstate = self.robot.get_right_arm_jointState()
         left_arm_dim = len(left_jointstate) - 1
         right_arm_dim = len(right_jointstate) - 1
-        current_jointstate = np.array(left_jointstate + right_jointstate)
 
         left_arm_actions = action_chunk[:, :left_arm_dim]
         left_gripper_actions = action_chunk[:, left_arm_dim]
         right_arm_actions = action_chunk[:, left_arm_dim + 1 : left_arm_dim + 1 + right_arm_dim]
         right_gripper_actions = action_chunk[:, left_arm_dim + 1 + right_arm_dim]
 
-        current_state_arm = np.concatenate([
-            current_jointstate[:left_arm_dim],
-            current_jointstate[left_arm_dim + 1 : left_arm_dim + 1 + right_arm_dim],
-        ])
+        left_real_qpos = np.asarray(
+            self.robot.get_left_arm_real_jointState()[:left_arm_dim], dtype=np.float64)
+        right_real_qpos = np.asarray(
+            self.robot.get_right_arm_real_jointState()[:right_arm_dim], dtype=np.float64)
+        current_state_arm = np.concatenate([left_real_qpos, right_real_qpos])
         chunk_arm = np.concatenate([left_arm_actions, right_arm_actions], axis=1)  # (N, 12)
 
         current_gripper = np.array([
