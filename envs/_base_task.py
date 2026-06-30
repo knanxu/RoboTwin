@@ -1974,18 +1974,16 @@ class Base_Task(gym.Env):
     def take_chunk_action_per_action(self, action_chunk, vel_limit: float = 5.0,
                                      acc_limit: float = 10.0, v: float = 1.0,
                                      video_save_freq: int = -1, max_actions: int = None):
-        """后端 B: 逐 action 两点 TOPPRA + 段间非零边界速度 (方法 B), 消除 stop-and-go.
+        """后端 B: 逐 action 两点 TOPPRA，段间速度固定归零 (stop-and-go).
 
-        与原 (复用 take_action 的两点零速) 的差异:
-          - 每个 action 绕过 mplib, 自调 retime_chunk(单 target) 并传非零 sd_start/sd_end,
-            段间速度幅值不归零 (真加速); 速度方向在段间仍突变 (两点直线几何必然), 靠 PD 兜底.
-          - current 用实测 qpos/qvel (闭环纠累积误差); sd_start = 实测速度切向投影,
-            sd_end = safety*sd_max (绝对值制: sd_max=vel_limit/max|tangent|, 段间不再归零、无 v_cruise).
+          - 每个 action 绕过 mplib，自调 retime_chunk(单 target)，固定传
+            sd_start=sd_end=0，避免相邻两点路径方向突变造成边界速度/加速度尖峰。
+          - chunk 首段 current 用实测 qpos；后续段用上一段命令 target，保持既有几何语义。
           - duration 累加真实 TOPP 时长 (非 dense_steps/250, 消除伪快统计).
           - 保留逐 action 粒度: 每 action 后查 success / 可中断 (partial chunk / async).
         retime_chunk 默认 (0,0) 不变, whole_chunk 不受影响.
         """
-        from .robot.toppra_chunk_executor import retime_chunk, compute_segment_sd_bounds
+        from .robot.toppra_chunk_executor import retime_chunk
 
         info = {
             "status": "success",
@@ -2042,11 +2040,9 @@ class Base_Task(gym.Env):
         total_duration = 0.0
         _t_obs0 = float(getattr(self, "_last_success_obs_time", 0.0))
 
-        # 开环前馈: 段内不读实测 (真机软 PD 跟踪滞后会逐段累积污染 q_current → seg/T 暴增,
-        # 见 scripts/diag_per_action.py); chunk 首段从实测当前状态起 (闭环), 段间用命令 target +
-        # 上段 sd_end 前馈连续. chunk 间由 learner/VLA replan (基于实测 obs) 闭环纠误差.
+        # chunk 首段从实测当前状态起；后续段从上一命令 target 起。每段 TOPPRA 均零速起止，
+        # 不继承上一段规划速度，避免两点直线路径方向突变在 action 边界制造 qd 跳变。
         prev_q = None
-        prev_qd = None
 
         for i in range(M):
             if self.take_action_cnt >= self.step_lim or self.eval_success:
@@ -2054,28 +2050,19 @@ class Base_Task(gym.Env):
 
             target = np.asarray(chunk_arm[i], dtype=np.float64)                          # (12,)
             if prev_q is None:
-                # 首段 (或 TOPP 回退后): 从实测当前状态起 (chunk 开头闭环)
+                # 首段 (或 TOPP 回退后): 从实测当前状态起。
                 cur_left = self.robot.get_left_arm_real_jointState()[:left_arm_dim]
                 cur_right = self.robot.get_right_arm_real_jointState()[:right_arm_dim]
                 q_current = np.asarray(list(cur_left) + list(cur_right), dtype=np.float64)
-                qd_left = self.robot.get_left_arm_real_jointVelocity()
-                qd_right = self.robot.get_right_arm_real_jointVelocity()
-                qd_actual = np.asarray(list(qd_left) + list(qd_right), dtype=np.float64)
-                sd_start, sd_end, tangent, seg_len = compute_segment_sd_bounds(
-                    q_current, qd_actual, target, vel_limit=vel_limit, acc_limit=acc_limit,
-                )
             else:
-                # 后续段: 开环前馈, q_current = 上段命令 target, qd = 上段规划末速度向量
-                # (投影到本段 tangent → 方向突变自动反映, 不高估 sd_start; 不读实测避免软 PD 滞后)
+                # 后续段: q_current = 上段命令 target。
                 q_current = prev_q
-                sd_start, sd_end, tangent, seg_len = compute_segment_sd_bounds(
-                    q_current, prev_qd, target, vel_limit=vel_limit, acc_limit=acc_limit,
-                )
 
-            # 退化段 (current≈target): 不 TOPP, 仅推进 cnt
-            if tangent is None:
+            seg_len = float(np.linalg.norm(target - q_current))
+
+            # 退化段 (current≈target): 不 TOPP, 仅推进 cnt。
+            if seg_len < 1e-6:
                 prev_q = target
-                prev_qd = np.zeros(left_arm_dim + right_arm_dim, dtype=np.float64)
                 self.take_action_cnt += 1
                 executed += 1
                 continue
@@ -2090,7 +2077,7 @@ class Base_Task(gym.Env):
                 current_gripper=current_gripper,
                 chunk_gripper=chunk_gripper[i][None, :],     # (1, 2)
                 vel_limit=vel_limit, acc_limit=acc_limit, exec_hz=250,
-                sd_start=sd_start, sd_end=sd_end,
+                sd_start=0.0, sd_end=0.0,
             )
 
             # TOPP 失败 → 该段回退原 mplib take_action (stop-and-go); 回退改了实测, 下段重闭环起
@@ -2099,7 +2086,6 @@ class Base_Task(gym.Env):
                                      video_save_freq=video_save_freq)
                 dense_steps += int(n or 0)   # take_action 内部已 cnt += 1
                 prev_q = None
-                prev_qd = None
                 executed += 1
                 if self.eval_success:
                     break
@@ -2143,8 +2129,7 @@ class Base_Task(gym.Env):
                     seg_success = True
                     break
 
-            prev_q = target          # 开环: 下段从命令 target 起 (不读实测, 避免软 PD 滞后累积)
-            prev_qd = dense_arm_vel[-1]   # 上段规划末速度向量, 供下段投影算 sd_start
+            prev_q = target          # 下段从命令 target 起。
             self.take_action_cnt += 1
             executed += 1
             if seg_success or self.eval_success:
