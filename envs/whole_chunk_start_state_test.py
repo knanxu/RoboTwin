@@ -46,7 +46,7 @@ def test_whole_chunk_retime_starts_from_measured_qpos(monkeypatch):
     env.step_lim = 100
     env.eval_success = False
     env.take_chunk_action(
-        np.zeros((2, 14)), vel_limit=1.0, acc_limit=1.0, v=1.0
+        np.zeros((2, 14)), vel_limit=1.0, execution_steps=None
     )
 
     expected = np.array(

@@ -20,7 +20,7 @@ import toppra.algorithm as algo
 
 
 # 绝对值制: vel_limit/acc_limit 直接作关节速度/加速度上限 (rad/s, rad/s^2), 标量广播到各 dof。
-# 不在此处钳物理天花板 —— 上限由调用方 (exec_backends grid) 保证在真机物理范围内。
+# 不在此处钳物理天花板；whole-chunk 可按 ``acc_limit=4*vel_limit**2`` 直接传入。
 # (仿真不在物理层 clamp, 约束完全靠 TOPPRA 参考轨迹满足上限; take_action/mplib fallback 路径
 #  另有自己的钳, 见 planner.py。)
 
@@ -44,7 +44,7 @@ def retime_chunk(
         chunk_arm:          (N, dof_arm) 目标路径航点 (不含当前点)
         current_gripper:    (dof_gripper,)  当前夹爪值, dof_gripper 通常 = 2
         chunk_gripper:      (N, dof_gripper) 目标夹爪序列
-        vel_limit:          float, 绝对关节速度上限 (rad/s, 标量广播到各 dof; 上限由调用方 grid 保证)
+        vel_limit:          float, 绝对关节速度上限 (rad/s, 标量广播到各 dof)
         acc_limit:          float, 绝对关节加速度上限 (rad/s^2, 同上)
         exec_hz: 采样频率 (对齐 scene.set_timestep, RoboTwin 为 250)
 
@@ -110,7 +110,7 @@ def retime_chunk(
     )
 
     # 5. TOPPRA 约束 (绝对值制: vel_limit/acc_limit 直接作关节上限, 标量广播到 dof;
-    #    上限由调用方 grid 保证在物理范围内, 此处不再钳天花板)
+    #    此处不钳速度或加速度天花板)
     dof = kept_arm.shape[1]
     vel_lim = np.full(dof, float(vel_limit), dtype=np.float64)
     acc_lim = np.full(dof, float(acc_limit), dtype=np.float64)

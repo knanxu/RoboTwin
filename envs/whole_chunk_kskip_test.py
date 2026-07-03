@@ -55,9 +55,9 @@ def test_whole_chunk_k_skip_truncates_chunk_before_toppra(monkeypatch):
     monkeypatch.setattr(tce, "retime_chunk", _fake_retime_capture(captured))
     env = _make_env()
 
-    # 5-frame chunk, max_actions=2 → 只前 2 帧进入整段 TOPPRA
+    # 5-frame chunk, execution_steps=2 → 只前 2 帧进入整段 TOPPRA
     info = env.take_chunk_action(
-        np.zeros((5, 14)), vel_limit=1.0, acc_limit=1.0, v=1.0, max_actions=2,
+        np.zeros((5, 14)), vel_limit=1.0, execution_steps=2,
     )
 
     chunk_arm = np.asarray(captured["chunk_arm"], dtype=float)
@@ -65,14 +65,14 @@ def test_whole_chunk_k_skip_truncates_chunk_before_toppra(monkeypatch):
     assert info["take_action_cnt_delta"] == 2, info
 
 
-def test_whole_chunk_none_max_actions_keeps_full_chunk(monkeypatch):
+def test_whole_chunk_none_execution_steps_keeps_full_chunk(monkeypatch):
     captured = {}
     monkeypatch.setattr(tce, "retime_chunk", _fake_retime_capture(captured))
     env = _make_env()
 
-    # max_actions=None → 整段保留 (旧行为)
+    # execution_steps=None → 整段保留（专家回放路径）
     info = env.take_chunk_action(
-        np.zeros((5, 14)), vel_limit=1.0, acc_limit=1.0, v=1.0, max_actions=None,
+        np.zeros((5, 14)), vel_limit=1.0, execution_steps=None,
     )
 
     chunk_arm = np.asarray(captured["chunk_arm"], dtype=float)

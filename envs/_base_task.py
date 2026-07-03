@@ -1784,8 +1784,8 @@ class Base_Task(gym.Env):
         return dense_steps_taken
 
 
-    def take_chunk_action(self, action_chunk, vel_limit: float = 5.0, acc_limit: float = 10.0, v: float = 1.0,
-                          video_save_freq: int = -1, max_actions: int = None):
+    def take_chunk_action(self, action_chunk, vel_limit: float = 4.0,
+                          execution_steps: int = None, video_save_freq: int = -1):
         """
         整段 TOPPRA 执行器: 对一整段 action chunk 做一次 TOPPRA 时间重参数化,
         按 250Hz (对齐 scene.timestep) 密集采样后逐点下发.
@@ -1801,16 +1801,13 @@ class Base_Task(gym.Env):
                 [left_arm (left_arm_dim), left_gripper (1),
                  right_arm (right_arm_dim), right_gripper (1)]
                 注意: 只支持 action_type='qpos', ee 模式用原 take_action.
-            vel_scale, acc_scale: TOPPRA 速度 / 加速度约束倍率.
-            v: chunk 压缩重构比率. v=1.0 不压缩; v>1.0 帧数减少 (走得更稀疏);
-               v<1.0 帧数增加 (插帧平滑). 压缩后的帧数 M 即为本次消耗的 cnt 预算.
+            vel_limit: TOPPRA 绝对关节速度限制 (rad/s). 加速度限制由执行层固定计算为
+               acc_limit = 4 * vel_limit**2, 不再作为独立控制量.
+            execution_steps: 只取输入 chunk 的前 N 帧再做 spline/TOPPRA. None/<=0
+               表示使用完整输入 chunk；正整数用于 SpeedTune whole-chunk 的 k_skip.
             video_save_freq: >0 时在物理步循环内每隔该步数采一帧写入 eval 视频
                (250Hz / 25 = 10fps, 与 eval 视频标称帧率一致, 回放约等于实时).
                默认 -1 保持原行为: 每次调用只在开头写 1 帧.
-            max_actions: k_skip (论文式 frame skip). >0 且 reconstruct 后帧数超过它时,
-               只保留前 max_actions 帧再做整段 TOPPRA, 执行完即返回 (上层重推 VLA, 闭环).
-               None/<=0 → 不截断, 整段执行 (旧行为, 向后兼容). 与 per_action 的 _apply_k_skip 一致.
-
         Returns:
             info: dict, 执行统计
                 status:           'success' | 'topp_fallback' | 'truncated'
@@ -1828,6 +1825,10 @@ class Base_Task(gym.Env):
             "take_action_cnt_delta": 0,
             "topp_return_code": None,
             "success_obs_time": 0.0,   # success 分支里 get_obs()+视频写入 的耗时, 用于调试/剔除
+            "vel_limit": float(vel_limit),
+            "acc_limit": 4.0 * float(vel_limit) ** 2,
+            "execution_steps": 0,
+            "planned_cruise_fraction": 0.0,
         }
 
         if self.take_action_cnt >= self.step_lim or self.eval_success:
@@ -1840,31 +1841,23 @@ class Base_Task(gym.Env):
             info["fallback_reason"] = f"invalid chunk shape: {action_chunk.shape}"
             return info
 
-        # ---- 先按 v 压缩 / 插帧重构 chunk ----
-        if v != 1.0:
-            from .utils.chunk_accel import reconstruct_chunk
-            action_chunk = reconstruct_chunk(action_chunk, float(v))
-            if action_chunk.shape[0] == 0:
-                info["status"] = "topp_fallback"
-                info["fallback_reason"] = f"reconstruct_chunk produced empty chunk at v={v}"
-                return info
-
-        # ---- 方案 β: 预算不够时截断 chunk, 保证 cnt 语义和原 take_action 一致 ----
+        # ---- 先截 execution_steps，再做 spline/TOPPRA；whole-chunk 不再 reconstruct(v) ----
+        requested = int(action_chunk.shape[0])
+        if execution_steps is not None and int(execution_steps) > 0:
+            requested = int(execution_steps)
         remaining_budget = int(self.step_lim - self.take_action_cnt)
-        if action_chunk.shape[0] > remaining_budget:
-            action_chunk = action_chunk[:remaining_budget]
+        keep = min(int(action_chunk.shape[0]), requested, remaining_budget)
+        if keep < action_chunk.shape[0]:
             info["chunk_truncated"] = True
-            if action_chunk.shape[0] == 0:
-                info["status"] = "truncated"
-                return info
+        if keep <= 0:
+            info["status"] = "truncated"
+            return info
+        action_chunk = action_chunk[:keep]
 
-        # ---- k_skip (论文式 frame skip): 只取前 max_actions 帧再做整段 TOPPRA ----
-        # 与 per_action (_apply_k_skip @ take_chunk_action_per_action) 一致: 在预算截断之后、
-        # 拆臂/TOPPRA 之前截断; max_actions=None/<=0 → 整段执行 (旧行为).
-        action_chunk = _apply_k_skip(action_chunk, max_actions)
-
-        # 压缩后 chunk 帧数 M: 代表策略实际下发的 action 数量, 也是本次调用消耗的 cnt 预算
+        # 输入窗口帧数 M: 代表策略实际下发的 action 数量, 也是本次调用消耗的 cnt 预算
         M = int(action_chunk.shape[0])
+        info["execution_steps"] = M
+        acc_limit = info["acc_limit"]
 
         # ---- 拆分臂 / 夹爪 (复用 take_action 的拆法) ----
         left_jointstate = self.robot.get_left_arm_jointState()
@@ -1917,6 +1910,11 @@ class Base_Task(gym.Env):
 
         info["duration"] = retimed["duration"]
         info["topp_return_code"] = retimed["return_code"]
+        if T > 0:
+            planned_speed = np.max(np.abs(dense_arm_vel), axis=1)
+            info["planned_cruise_fraction"] = float(
+                np.mean(planned_speed >= 0.95 * float(vel_limit))
+            )
 
         # ---- 外层 1 次调用 = M 个 action 下发, cnt 一次性加 M ----
         # 物理步循环里只跑 scene.step + check_success, 不再动 cnt.
@@ -2178,6 +2176,8 @@ class Base_Task(gym.Env):
             "take_action_cnt_delta": 0,
             "topp_return_code": None,
             "success_obs_time": 0.0,
+            "fixed_time_speed_violation": False,
+            "max_planned_qvel": 0.0,
         }
         if self.take_action_cnt >= self.step_lim or self.eval_success:
             info["status"] = "truncated"
@@ -2237,6 +2237,13 @@ class Base_Task(gym.Env):
                 q_left_1, q_right_1 = q_left_0, q_right_0
             left_vel = (q_left_1 - q_left_0) * rate
             right_vel = (q_right_1 - q_right_0) * rate
+            seg_max_qvel = max(
+                float(np.max(np.abs(left_vel))),
+                float(np.max(np.abs(right_vel))),
+            )
+            info["max_planned_qvel"] = max(info["max_planned_qvel"], seg_max_qvel)
+            if seg_max_qvel > 4.0:
+                info["fixed_time_speed_violation"] = True
 
             for h in range(H):
                 self._update_render()
@@ -2287,10 +2294,11 @@ class Base_Task(gym.Env):
           "streaming"   后端 A: 论文式固定时长流式 (无 TOPP), 用 self.stream_hold_steps;
                         vel/acc 不适用 (不钳物理上限, 忠实论文).
           "per_action"  后端 B: RoboTwin 原生逐 action 点到点 TOPP, 外露 vel/acc.
-          "whole_chunk" 后端 C (默认): 整段 TOPPRA. 保持原行为.
+          "whole_chunk" 后端 C (默认): 单 vel_limit 整段 TOPPRA，acc=4*vel².
 
         self.exec_backend / self.stream_hold_steps 由 eval 脚本设到 TASK_ENV 上
-        (缺省 whole_chunk; stream_hold_steps 缺省对齐采集 save_freq=15).
+        (缺省 whole_chunk; stream_hold_steps 缺省对齐采集 save_freq=15；可选 k_skip
+        作为 whole-chunk 的 execution_steps).
         video_save_freq 透传给三个后端的实时写帧 (_tick_eval_video).
         """
         backend = getattr(self, "exec_backend", "whole_chunk")
@@ -2305,7 +2313,8 @@ class Base_Task(gym.Env):
                 action_chunk, vel_limit=vel_limit, acc_limit=acc_limit, v=v,
                 video_save_freq=video_save_freq)
         return self.take_chunk_action(
-            action_chunk, vel_limit=vel_limit, acc_limit=acc_limit, v=v,
+            action_chunk, vel_limit=vel_limit,
+            execution_steps=getattr(self, "k_skip", None),
             video_save_freq=video_save_freq)
 
 
